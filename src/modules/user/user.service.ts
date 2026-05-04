@@ -3,14 +3,12 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { User } from './user.entity';
 import { userCreateDto } from './user.dto';
-import { AuthService } from '../auth/auth.service';
 
 @Injectable()
 export class UserService {
   constructor(
     @InjectRepository(User)
     private userRepository: Repository<User>,
-    private readonly authService: AuthService,
   ) {}
 
   async getById(id: number) {
@@ -20,31 +18,30 @@ export class UserService {
   }
 
   async getByPhoneNumber(phone: string) {
-    return await this.userRepository.find({
+    return await this.userRepository.findOne({
       where: { phone },
     });
   }
 
-  async getToken(id: number) {
-    const user = await this.getById(id);
-    if (user === null) {
-      throw new HttpException('User not found', 404);
+  async findByPhoneNumberOrCreate(phone: string): Promise<User> {
+    const existing = await this.getByPhoneNumber(phone);
+    if (existing) {
+      return existing;
     }
 
-    return this.authService.generateToken(user);
+    const user = this.userRepository.create({ phone });
+    return await this.userRepository.save(user);
   }
 
   async create(data: userCreateDto) {
-    // Create a new user
     const { phone } = data;
 
-    if ((await this.getByPhoneNumber(phone)) !== null) {
+    const existing = await this.getByPhoneNumber(phone);
+    if (existing) {
       throw new HttpException('User exists', 400);
     }
 
     const user = this.userRepository.create(data);
-
-    // Save the user to the database
     return await this.userRepository.save(user);
   }
 }

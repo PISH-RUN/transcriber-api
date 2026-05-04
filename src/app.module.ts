@@ -7,17 +7,18 @@ import { DatabaseModule } from './libs/database/database.module';
 import { LoggerMiddleware } from './libs/logger/logger.middleware';
 import { ConfigModule } from './libs/config/config.module';
 import { UserModule } from './modules/user/user.module';
+import { FileModule } from './modules/file/file.module';
 import { APP_INTERCEPTOR } from '@nestjs/core';
 import { ResponseInterceptor } from './libs/interceptors/response.interceptor';
 
 @Module({
-  imports: [AuthModule, DatabaseModule, ConfigModule, UserModule],
+  imports: [AuthModule, DatabaseModule, ConfigModule, UserModule, FileModule],
   controllers: [AppController],
   providers: [
     AppService,
     {
       provide: APP_INTERCEPTOR,
-      useClass: ResponseInterceptor, // Use the response interceptor globally
+      useClass: ResponseInterceptor,
     },
   ],
 })

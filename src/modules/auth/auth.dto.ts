@@ -1,19 +1,2 @@
-import { IsEmail, IsNotEmpty } from 'class-validator';
-
-export class LoginDto {
-  @IsEmail()
-  email: string;
-
-  @IsNotEmpty()
-  password: string;
-}
-
-export class RegisterDto {
-  @IsEmail()
-  email: string;
-
-  @IsNotEmpty()
-  password: string;
-
-  name: string;
-}
+// Auth DTOs are defined inline in auth.controller.ts (RequestOtpDto)
+// OTP DTOs are in libs/otp/otp.dto.ts

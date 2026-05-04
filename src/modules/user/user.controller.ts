@@ -11,11 +11,6 @@ export class UserController {
     return this.userService.getById(id);
   }
 
-  @Get('/login/:id')
-  login(@Param('id') id: number) {
-    return this.userService.getToken(id);
-  }
-
   @Post()
   createUser(@Body() data: userCreateDto) {
     return this.userService.create(data);
