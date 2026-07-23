@@ -8,11 +8,21 @@ import { LoggerMiddleware } from './libs/logger/logger.middleware';
 import { ConfigModule } from './libs/config/config.module';
 import { UserModule } from './modules/user/user.module';
 import { FileModule } from './modules/file/file.module';
+import { PersonModule } from './modules/person/person.module';
+import { TranscriptionModule } from './modules/transcription/transcription.module';
 import { APP_INTERCEPTOR } from '@nestjs/core';
 import { ResponseInterceptor } from './libs/interceptors/response.interceptor';
 
 @Module({
-  imports: [AuthModule, DatabaseModule, ConfigModule, UserModule, FileModule],
+  imports: [
+    AuthModule,
+    DatabaseModule,
+    ConfigModule,
+    UserModule,
+    FileModule,
+    PersonModule,
+    TranscriptionModule,
+  ],
   controllers: [AppController],
   providers: [
     AppService,

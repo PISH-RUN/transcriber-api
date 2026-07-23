@@ -1,0 +1,130 @@
+import {
+  Column,
+  Entity,
+  JoinColumn,
+  ManyToOne,
+  OneToMany,
+} from 'typeorm';
+import { BaseTimestampEntity } from '../../common/abstracts/base.entity';
+import { FileEntity } from '../file/file.entity';
+
+export enum TranscriptionStatus {
+  PENDING = 'pending', // created, queued for processing
+  PROCESSING = 'processing', // STT + diarization + samples running
+  AWAITING_MAPPING = 'awaiting_mapping', // ready for the user to confirm speakers
+  COMPLETED = 'completed', // speakers confirmed, final text ready
+  FAILED = 'failed',
+}
+
+/** Display/diarization info per detected speaker plus an auto-suggested match. */
+export interface SpeakerSample {
+  speakerId: string; // "SPEAKER_00"
+  speakerLabel: string; // "گوینده 1"
+  speakerNumber: number;
+  audioPath: string; // S3 key of the sample clip
+  totalDuration: number; // total seconds this speaker talks
+  sampleStart: number;
+  sampleEnd: number;
+  suggestedPersonId?: number | null; // auto-match from voiceprint identify
+  suggestedConfidence?: number | null;
+}
+
+@Entity('transcriptions')
+export class Transcription extends BaseTimestampEntity {
+  @Column({ length: 255 })
+  title: string;
+
+  @Column({
+    type: 'enum',
+    enum: TranscriptionStatus,
+    default: TranscriptionStatus.PENDING,
+  })
+  status: TranscriptionStatus;
+
+  @Column({ nullable: true })
+  status_message?: string;
+
+  @Column({ type: 'float', nullable: true })
+  duration?: number;
+
+  // Transcript with anonymous speaker labels ("گوینده 1 [..]: ...").
+  @Column({ type: 'text', nullable: true })
+  raw_text?: string;
+
+  // Transcript with resolved person names, produced after speaker mapping.
+  @Column({ type: 'text', nullable: true })
+  final_text?: string;
+
+  @Column({ nullable: true })
+  diarization_source?: 'pyannote' | 'identify' | 'soniox' | 'none';
+
+  // Raw Soniox tokens (large — excluded from default selects).
+  @Column({ type: 'jsonb', nullable: true, select: false })
+  stt_tokens?: Array<{
+    text: string;
+    start_ms: number;
+    end_ms: number;
+    speaker?: number;
+  }>;
+
+  // Pyannote diarization segments (large — excluded from default selects).
+  @Column({ type: 'jsonb', nullable: true, select: false })
+  diarization?: Array<{ start: number; end: number; speaker: string }>;
+
+  // Merged, speaker-attributed segments used to render the conversation.
+  @Column({ type: 'jsonb', nullable: true })
+  segments?: Array<{
+    speaker_id: string;
+    speaker_label: string;
+    text: string;
+    start_time: string;
+    end_time: string;
+    start_ms: number;
+    end_ms: number;
+  }>;
+
+  @Column({ type: 'jsonb', nullable: true })
+  speaker_samples?: SpeakerSample[];
+
+  @Column({ nullable: true })
+  speaker_samples_status?: 'processing' | 'done' | 'failed';
+
+  // Map of speaker_id -> person id (null = leave anonymous). Set on confirm.
+  @Column({ type: 'jsonb', nullable: true })
+  speaker_map?: Record<string, number | null>;
+
+  // People the user expects to be present (drives voiceprint identification).
+  @Column({ type: 'jsonb', nullable: true })
+  expected_person_ids?: number[];
+
+  // The single processed (merged + transcoded) MP3 we transcribe and play back.
+  @Column({ nullable: true })
+  processed_audio_id?: number;
+  @ManyToOne(() => FileEntity, { eager: true, nullable: true })
+  @JoinColumn({ name: 'processed_audio_id' })
+  processed_audio?: FileEntity;
+
+  @OneToMany(() => TranscriptionAudio, (audio) => audio.transcription)
+  audioFiles: TranscriptionAudio[];
+}
+
+@Entity('transcription_audio_files')
+export class TranscriptionAudio extends BaseTimestampEntity {
+  @Column()
+  transcription_id: number;
+  @ManyToOne(() => Transcription, (t) => t.audioFiles, { onDelete: 'CASCADE' })
+  @JoinColumn({ name: 'transcription_id' })
+  transcription: Transcription;
+
+  @Column()
+  audio_id: number;
+  @ManyToOne(() => FileEntity, { eager: true })
+  @JoinColumn({ name: 'audio_id' })
+  audio: FileEntity;
+
+  @Column({ type: 'int', default: 1 })
+  order: number;
+
+  @Column({ length: 512, nullable: true })
+  original_name?: string;
+}

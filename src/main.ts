@@ -1,9 +1,20 @@
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { ValidationPipe } from '@nestjs/common';
+import { configureFfmpeg } from './libs/ffmpeg/ffmpeg.util';
 
 async function bootstrap() {
+  // Point fluent-ffmpeg at the bundled ffmpeg/ffprobe binaries.
+  configureFfmpeg();
+
   const app = await NestFactory.create(AppModule);
+
+  // The transcriber MVP has no auth; allow the frontend (and any local tool)
+  // to call the API directly from the browser.
+  app.enableCors({
+    origin: true,
+    credentials: true,
+  });
 
   app.useGlobalPipes(
     new ValidationPipe({

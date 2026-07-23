@@ -125,6 +125,34 @@ export class FileService {
 
   async updateFileDocument(fileId, DocumentId) {}
 
+  /**
+   * Upload a file from a local path to S3 WITHOUT creating a DB row. Returns
+   * the S3 key. Used for ephemeral artifacts such as per-speaker sample clips
+   * that we serve via presigned URLs and don't need to track in the DB.
+   */
+  async uploadToS3Only(
+    filePath: string,
+    contentType: string = 'audio/mpeg',
+  ): Promise<string> {
+    if (!filePath || !fs.existsSync(filePath)) {
+      throw new BadRequestException('Invalid file path');
+    }
+
+    const fileBuffer = fs.readFileSync(filePath);
+    const fileName = path.basename(filePath);
+    const s3Key = `${contentType}/${Date.now()}_${fileName}`;
+
+    const command = new PutObjectCommand({
+      Bucket: this.bucketName,
+      Key: s3Key,
+      Body: fileBuffer,
+      ContentType: contentType,
+    });
+
+    await this.s3Client.send(command);
+    return s3Key;
+  }
+
   async findFileById(id: number) {
     return await this.fileRepository.findOne({
       where: {

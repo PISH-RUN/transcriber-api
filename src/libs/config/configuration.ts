@@ -36,5 +36,14 @@ export default () => ({
     public_url: process.env.S3_PUBLIC_URL || '',
     endpoint: process.env.S3_ENDPOINT || '',
   },
-  appName: process.env.APP_NAME || 'Pishrun Project',
+  // Soniox async speech-to-text (https://api.soniox.com)
+  soniox: {
+    apiKey: process.env.SONIOX_API_KEY || '',
+  },
+  // pyannoteAI speaker diarization + voiceprint identification (https://api.pyannote.ai/v1)
+  pyannote: {
+    apiKey: process.env.PYANNOTE_API_KEY || '',
+    enabled: process.env.ENABLE_PYANNOTE_DIARIZATION === 'true',
+  },
+  appName: process.env.APP_NAME || 'Transcriber',
 });
