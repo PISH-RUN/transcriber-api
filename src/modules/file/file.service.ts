@@ -16,7 +16,7 @@ import { DataSource, Repository } from 'typeorm';
 import { FileEntity } from './file.entity';
 import { FileDto } from './file.dto';
 import * as fs from 'node:fs';
-import path from 'node:path';
+import * as path from 'node:path';
 
 @Injectable()
 export class FileService {

@@ -27,6 +27,6 @@ export class Person extends BaseTimestampEntity {
 
   // S3 key of the audio clip the current voiceprint was created from (so the
   // UI can offer a "listen to reference" playback).
-  @Column({ length: 512, nullable: true })
+  @Column({ type: 'varchar', length: 512, nullable: true })
   sample_audio_path?: string | null;
 }

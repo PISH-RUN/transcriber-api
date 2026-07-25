@@ -121,12 +121,16 @@ export class TranscriptionController {
   }
 
   @Patch(':id')
-  @ApiOperation({ summary: 'Update transcription title' })
+  @ApiOperation({
+    summary: 'Update a transcription (title and/or edited segments)',
+    description:
+      'Edit the transcription title, a segment’s text, or reassign a segment to a different speaker. When segments are provided the whole segments array is replaced and the derived transcript text is rebuilt.',
+  })
   update(
     @Param('id', ParseIntPipe) id: number,
     @Body() dto: UpdateTranscriptionDto,
   ) {
-    return this.transcriptionService.updateTitle(id, dto.title ?? '');
+    return this.transcriptionService.update(id, dto);
   }
 
   @Delete(':id')

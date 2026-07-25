@@ -177,11 +177,74 @@ export class TranscriptionService {
     return t;
   }
 
-  async updateTitle(id: number, title: string): Promise<Transcription> {
+  /**
+   * Update an existing transcription's title and/or its speaker-attributed
+   * segments (the user editing a line's text or reassigning a line to a
+   * different speaker). When segments change we rebuild the derived
+   * `raw_text` / `final_text` so exports and any downstream consumers stay in
+   * sync with the edited conversation.
+   */
+  async update(
+    id: number,
+    dto: { title?: string; segments?: Transcription['segments'] },
+  ): Promise<any> {
     const t = await this.transcriptionRepo.findOne({ where: { id } });
     if (!t) throw new HttpException('رونویسی یافت نشد', 404);
-    t.title = title;
-    return this.transcriptionRepo.save(t);
+
+    const patch: Partial<Transcription> = {};
+
+    if (dto.title !== undefined) {
+      patch.title = dto.title;
+    }
+
+    if (dto.segments !== undefined) {
+      // Normalize: collapse adjacent segments that share a speaker (e.g. after
+      // the user reassigns a line to match its neighbour) into one block.
+      const segments = this.mergeConsecutiveSpeakers(dto.segments ?? []);
+      patch.segments = segments as any;
+
+      // Rebuild the anonymous-label transcript (uses speaker_label).
+      patch.raw_text = this.merger.generateRawText(segments as any);
+
+      // Rebuild the named transcript using the saved speaker → person map.
+      const speakerMap = t.speaker_map ?? {};
+      const persons = await this.personService.findByIds(
+        Object.values(speakerMap).filter((v): v is number => v != null),
+      );
+      const personById = new Map(persons.map((p) => [p.id, p]));
+      patch.final_text = this.buildFinalText(segments, speakerMap, personById);
+    }
+
+    if (Object.keys(patch).length > 0) {
+      await this.transcriptionRepo.update(id, patch);
+    }
+
+    return this.getDetail(id);
+  }
+
+  /**
+   * Merge adjacent segments that share the same speaker_id into a single
+   * segment (text space-joined, end time/ms taken from the later one). Mirrors
+   * the pipeline's post-merge normalization so user edits keep the "one block
+   * per continuous speaker turn" invariant.
+   */
+  private mergeConsecutiveSpeakers(
+    segments: NonNullable<Transcription['segments']>,
+  ): NonNullable<Transcription['segments']> {
+    const result: NonNullable<Transcription['segments']> = [];
+    for (const seg of segments) {
+      const last = result[result.length - 1];
+      if (last && last.speaker_id === seg.speaker_id) {
+        const left = (last.text ?? '').trim();
+        const right = (seg.text ?? '').trim();
+        last.text = left && right ? `${left} ${right}` : left || right;
+        last.end_time = seg.end_time;
+        last.end_ms = seg.end_ms;
+      } else {
+        result.push({ ...seg });
+      }
+    }
+    return result;
   }
 
   async remove(id: number): Promise<{ success: boolean }> {

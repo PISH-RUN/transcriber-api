@@ -1,4 +1,4 @@
-import ffmpeg from 'fluent-ffmpeg';
+import * as ffmpeg from 'fluent-ffmpeg';
 
 /**
  * Configure fluent-ffmpeg to use the ffmpeg/ffprobe binaries shipped by the

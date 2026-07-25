@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as fs from 'fs';
 import axios from 'axios';
-import FormData from 'form-data';
+import * as FormData from 'form-data';
 import { SonioxToken } from './transcript-merger.service';
 import { ProcessingError } from './processing-errors';
 
