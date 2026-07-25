@@ -83,6 +83,22 @@ export class Transcription extends BaseTimestampEntity {
     end_ms: number;
   }>;
 
+  // --- AI proof-reading pass ---------------------------------------------
+  // Status of the Gemini clean-up run over `segments`. Polled by the frontend.
+  @Column({ nullable: true })
+  refine_status?: 'processing' | 'done' | 'failed';
+
+  @Column({ nullable: true })
+  refine_message?: string;
+
+  @Column({ type: 'timestamp', nullable: true })
+  refined_at?: Date;
+
+  // Snapshot of `segments` taken right before the last refinement, so the user
+  // can go back to the raw STT text. Large — excluded from default selects.
+  @Column({ type: 'jsonb', nullable: true, select: false })
+  segments_before_refine?: Transcription['segments'];
+
   @Column({ type: 'jsonb', nullable: true })
   speaker_samples?: SpeakerSample[];
 

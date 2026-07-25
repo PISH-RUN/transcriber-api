@@ -3,6 +3,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { Transcription, TranscriptionAudio } from './transcription.entity';
 import { TranscriptionService } from './transcription.service';
 import { TranscriptionController } from './transcription.controller';
+import { AiModule } from '../ai/ai.module';
 import { FileModule } from '../file/file.module';
 import { AudioModule } from '../audio/audio.module';
 import { PersonModule } from '../person/person.module';
@@ -13,6 +14,7 @@ import { PersonModule } from '../person/person.module';
     FileModule,
     AudioModule,
     PersonModule,
+    AiModule,
   ],
   controllers: [TranscriptionController],
   providers: [TranscriptionService],

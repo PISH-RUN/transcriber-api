@@ -40,6 +40,17 @@ export default () => ({
   soniox: {
     apiKey: process.env.SONIOX_API_KEY || '',
   },
+  // Gemini, used to clean up STT errors in a finished transcript. Either an
+  // OpenRouter key or a Google AI Studio key is enough — OpenRouter wins when
+  // both are present.
+  llm: {
+    openrouterApiKey: process.env.OPENROUTER_API_KEY || '',
+    googleApiKey: process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '',
+    // Optional override; defaults per provider (see GeminiService).
+    refineModel: process.env.LLM_REFINE_MODEL || '',
+    openrouterReferer: process.env.OPENROUTER_REFERER || 'https://korsi.ir',
+    openrouterTitle: process.env.OPENROUTER_TITLE || 'Korsi Transcriber',
+  },
   // pyannoteAI speaker diarization + voiceprint identification (https://api.pyannote.ai/v1)
   pyannote: {
     apiKey: process.env.PYANNOTE_API_KEY || '',

@@ -133,6 +133,34 @@ export class TranscriptionController {
     return this.transcriptionService.update(id, dto);
   }
 
+  @Post(':id/remerge')
+  @ApiOperation({
+    summary: 'Rebuild the transcript from the stored STT tokens + diarization',
+    description:
+      'Re-runs the merger over the raw Soniox tokens and Pyannote segments kept on the row. Use it to apply merger improvements to an already-processed transcription. Replaces `segments` — manual text edits are lost.',
+  })
+  remerge(@Param('id', ParseIntPipe) id: number) {
+    return this.transcriptionService.remergeSegments(id);
+  }
+
+  @Post(':id/ai-refine')
+  @ApiOperation({
+    summary: 'Proof-read the transcript with Gemini 2.5 Flash',
+    description:
+      'Starts a background pass that fixes speech-to-text errors only: wording, Quranic/Arabic phrases and proper nouns are corrected, while tone, repetitions, unfinished sentences and the order of turns are left untouched. Returns immediately — poll GET /transcriptions/:id/status for refine_status / refine_message.',
+  })
+  aiRefine(@Param('id', ParseIntPipe) id: number) {
+    return this.transcriptionService.startAiRefine(id);
+  }
+
+  @Post(':id/ai-refine/revert')
+  @ApiOperation({
+    summary: 'Restore the transcript from before the AI proof-reading pass',
+  })
+  revertAiRefine(@Param('id', ParseIntPipe) id: number) {
+    return this.transcriptionService.revertAiRefine(id);
+  }
+
   @Delete(':id')
   @ApiOperation({ summary: 'Delete a transcription' })
   remove(@Param('id', ParseIntPipe) id: number) {

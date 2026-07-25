@@ -10,6 +10,7 @@ import {
 } from './transcription.entity';
 import { FileService } from '../file/file.service';
 import { PersonService } from '../person/person.service';
+import { TranscriptRefineService } from '../ai/transcript-refine.service';
 import { AudioProcessorService } from '../audio/audio-processor.service';
 import { SonioxClientService } from '../audio/soniox-client.service';
 import { PyannoteService, PyannoteSegment } from '../audio/pyannote.service';
@@ -43,6 +44,7 @@ export class TranscriptionService {
     private readonly soniox: SonioxClientService,
     private readonly pyannote: PyannoteService,
     private readonly merger: TranscriptMergerService,
+    private readonly refiner: TranscriptRefineService,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -157,6 +159,8 @@ export class TranscriptionService {
       processed_audio_url: processedAudioUrl,
       speaker_samples: speakerSamples,
       persons,
+      ai_refine_available: this.refiner.isConfigured(),
+      can_revert_refine: await this.hasRefineBackup(id),
     };
   }
 
@@ -168,6 +172,8 @@ export class TranscriptionService {
         't.status',
         't.status_message',
         't.speaker_samples_status',
+        't.refine_status',
+        't.refine_message',
       ])
       .where('t.id = :id', { id })
       .getOne();
@@ -200,19 +206,10 @@ export class TranscriptionService {
     if (dto.segments !== undefined) {
       // Normalize: collapse adjacent segments that share a speaker (e.g. after
       // the user reassigns a line to match its neighbour) into one block.
-      const segments = this.mergeConsecutiveSpeakers(dto.segments ?? []);
-      patch.segments = segments as any;
-
-      // Rebuild the anonymous-label transcript (uses speaker_label).
-      patch.raw_text = this.merger.generateRawText(segments as any);
-
-      // Rebuild the named transcript using the saved speaker → person map.
-      const speakerMap = t.speaker_map ?? {};
-      const persons = await this.personService.findByIds(
-        Object.values(speakerMap).filter((v): v is number => v != null),
+      Object.assign(
+        patch,
+        await this.buildSegmentsPatch(dto.segments ?? [], t.speaker_map ?? {}),
       );
-      const personById = new Map(persons.map((p) => [p.id, p]));
-      patch.final_text = this.buildFinalText(segments, speakerMap, personById);
     }
 
     if (Object.keys(patch).length > 0) {
@@ -220,6 +217,31 @@ export class TranscriptionService {
     }
 
     return this.getDetail(id);
+  }
+
+  /**
+   * Everything that has to be written when `segments` change: the normalized
+   * segments plus both derived transcripts. Shared by the manual edit endpoint,
+   * the AI refinement pass and the revert, so the three can never drift apart.
+   */
+  private async buildSegmentsPatch(
+    segments: NonNullable<Transcription['segments']>,
+    speakerMap: Record<string, number | null>,
+  ): Promise<Partial<Transcription>> {
+    const normalized = this.mergeConsecutiveSpeakers(segments);
+
+    const persons = await this.personService.findByIds(
+      Object.values(speakerMap).filter((v): v is number => v != null),
+    );
+    const personById = new Map(persons.map((p) => [p.id, p]));
+
+    return {
+      segments: normalized as any,
+      // Anonymous-label transcript (uses speaker_label).
+      raw_text: this.merger.generateRawText(normalized as any),
+      // Named transcript, using the saved speaker → person map.
+      final_text: this.buildFinalText(normalized, speakerMap, personById),
+    };
   }
 
   /**
@@ -245,6 +267,200 @@ export class TranscriptionService {
       }
     }
     return result;
+  }
+
+  /**
+   * Rebuild `segments` from the stored Soniox tokens + Pyannote diarization.
+   *
+   * The raw STT/diarization output is kept on the row, so an improvement to the
+   * merger (for example word-boundary-safe speaker attribution) can be applied
+   * to transcriptions that were already processed — without paying for STT
+   * again. Manual text edits are lost, which is why this is an explicit action.
+   */
+  async remergeSegments(id: number): Promise<any> {
+    const t = await this.transcriptionRepo
+      .createQueryBuilder('t')
+      .addSelect(['t.stt_tokens', 't.diarization'])
+      .where('t.id = :id', { id })
+      .getOne();
+
+    if (!t) throw new HttpException('رونویسی یافت نشد', 404);
+    if (!t.stt_tokens?.length) {
+      throw new HttpException('توکن‌های گفتار برای این رونویسی ذخیره نشده است', 400);
+    }
+
+    const segments = this.merger.mergeTranscripts(
+      (t.diarization ?? []) as any,
+      t.stt_tokens as any,
+    );
+    if (segments.length === 0) {
+      throw new HttpException('بازسازی متن نتیجه‌ای نداشت', 422);
+    }
+
+    const patch = await this.buildSegmentsPatch(
+      segments as any,
+      t.speaker_map ?? {},
+    );
+
+    await this.transcriptionRepo.update(id, {
+      ...patch,
+      // The previous text is gone, so a "revert to pre-AI" snapshot taken
+      // against it would be misleading.
+      segments_before_refine: null as any,
+      refine_status: null as any,
+      refine_message: null as any,
+      refined_at: null as any,
+    });
+
+    this.logger.log(
+      `[Remerge] Transcription ${id}: ${t.stt_tokens.length} tokens -> ${segments.length} turns`,
+    );
+
+    return this.getDetail(id);
+  }
+
+  // ---------------------------------------------------------------------------
+  // AI proof-reading (Gemini 2.5 Flash)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Kick off a Gemini clean-up pass over the transcript. Returns immediately;
+   * the frontend follows `refine_status` / `refine_message` while it runs,
+   * because a long meeting takes minutes and would blow any HTTP timeout.
+   */
+  async startAiRefine(id: number): Promise<any> {
+    if (!this.refiner.isConfigured()) {
+      throw new HttpException(
+        'سرویس هوش مصنوعی تنظیم نشده است (OPENROUTER_API_KEY یا GEMINI_API_KEY)',
+        503,
+      );
+    }
+
+    const t = await this.transcriptionRepo.findOne({ where: { id } });
+    if (!t) throw new HttpException('رونویسی یافت نشد', 404);
+    if (t.refine_status === 'processing') {
+      throw new HttpException('اصلاح هوشمند در حال اجراست', 409);
+    }
+    if (!t.segments || t.segments.length === 0) {
+      throw new HttpException('متنی برای اصلاح وجود ندارد', 400);
+    }
+
+    await this.transcriptionRepo.update(id, {
+      refine_status: 'processing',
+      refine_message: 'در صف اصلاح هوشمند...',
+    });
+
+    this.runAiRefine(id).catch((error) => {
+      this.logger.error(`[Refine] Transcription ${id} failed: ${error?.message}`);
+    });
+
+    return this.getStatus(id);
+  }
+
+  private async runAiRefine(id: number): Promise<void> {
+    this.logger.log(`[Refine] Starting transcription ${id} (${this.refiner.model})`);
+
+    try {
+      const t = await this.transcriptionRepo.findOne({ where: { id } });
+      if (!t?.segments?.length) throw new Error('متنی برای اصلاح وجود ندارد');
+
+      const original = t.segments;
+
+      // Snapshot before touching anything, so "بازگردانی متن اصلی" always has
+      // the pre-refinement version available.
+      await this.transcriptionRepo.update(id, {
+        segments_before_refine: original as any,
+        refine_message: 'در حال اصلاح متن با هوش مصنوعی...',
+      });
+
+      const { texts, changed, rejected, failedBatches, totalBatches } =
+        await this.refiner.refineSegments(original, async (done, total) => {
+          // One row update per finished batch — that's what the frontend polls.
+          await this.transcriptionRepo.update(id, {
+            refine_message: `اصلاح هوشمند: بخش ${done} از ${total}`,
+          });
+        });
+
+      if (totalBatches > 0 && failedBatches === totalBatches) {
+        throw new Error('هیچ بخشی از متن اصلاح نشد');
+      }
+
+      // Only the text of each line changes — speaker, order and timings are
+      // preserved exactly, so the audio timeline stays aligned.
+      const refined = original.map((segment, index) => ({
+        ...segment,
+        text: texts[index] ?? segment.text,
+      }));
+
+      // `speaker_map` may have changed while the job ran; re-read it.
+      const current = await this.transcriptionRepo.findOne({ where: { id } });
+      const patch = await this.buildSegmentsPatch(
+        refined,
+        current?.speaker_map ?? t.speaker_map ?? {},
+      );
+
+      const notes: string[] = [`${changed} خط اصلاح شد`];
+      if (rejected > 0) notes.push(`${rejected} پیشنهاد نامعتبر رد شد`);
+      if (failedBatches > 0) notes.push(`${failedBatches} بخش اصلاح نشد`);
+
+      await this.transcriptionRepo.update(id, {
+        ...patch,
+        refine_status: 'done',
+        refine_message: notes.join(' · '),
+        refined_at: new Date(),
+      });
+
+      this.logger.log(
+        `[Refine] Transcription ${id} done: ${changed} changed, ${rejected} rejected, ${failedBatches}/${totalBatches} batches failed`,
+      );
+    } catch (error: any) {
+      await this.transcriptionRepo.update(id, {
+        refine_status: 'failed',
+        refine_message: `خطا در اصلاح هوشمند: ${error?.message ?? 'نامشخص'}`,
+      });
+      throw error;
+    }
+  }
+
+  /** Put back the pre-refinement (raw STT) segments. */
+  async revertAiRefine(id: number): Promise<any> {
+    const t = await this.transcriptionRepo
+      .createQueryBuilder('t')
+      .addSelect('t.segments_before_refine')
+      .where('t.id = :id', { id })
+      .getOne();
+
+    if (!t) throw new HttpException('رونویسی یافت نشد', 404);
+    if (t.refine_status === 'processing') {
+      throw new HttpException('اصلاح هوشمند در حال اجراست', 409);
+    }
+    if (!t.segments_before_refine?.length) {
+      throw new HttpException('نسخه پیش از اصلاح هوشمند موجود نیست', 400);
+    }
+
+    const patch = await this.buildSegmentsPatch(
+      t.segments_before_refine,
+      t.speaker_map ?? {},
+    );
+
+    await this.transcriptionRepo.update(id, {
+      ...patch,
+      segments_before_refine: null as any,
+      refine_status: null as any,
+      refine_message: null as any,
+      refined_at: null as any,
+    });
+
+    return this.getDetail(id);
+  }
+
+  /** Does this transcription still have a pre-refinement snapshot to go back to? */
+  private async hasRefineBackup(id: number): Promise<boolean> {
+    const rows = await this.transcriptionRepo.query(
+      'SELECT segments_before_refine IS NOT NULL AS has FROM transcriptions WHERE id = $1',
+      [id],
+    );
+    return !!rows?.[0]?.has;
   }
 
   async remove(id: number): Promise<{ success: boolean }> {
