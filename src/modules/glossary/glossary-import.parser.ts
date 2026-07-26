@@ -80,7 +80,12 @@ const splitRow = (line: string): string[] =>
     .split('|')
     .map((cell) => cell.trim());
 
-/** Values inside a cell may be separated by Persian or latin commas, or by "/". */
+/**
+ * Values inside a cell may be separated by Persian or latin commas, or by "/".
+ *
+ * A dash-only entry is a placeholder for "nothing here", not a value — people
+ * write `—` in empty table cells, and so does our own export.
+ */
 const splitList = (value?: string): string[] => {
   if (!value) return [];
   return [
@@ -88,7 +93,7 @@ const splitList = (value?: string): string[] => {
       value
         .split(/[،,؛;/\n]+/)
         .map((item) => item.replace(/`/g, '').trim())
-        .filter(Boolean),
+        .filter((item) => item.length > 0 && !/^[-—–_]+$/.test(item)),
     ),
   ];
 };

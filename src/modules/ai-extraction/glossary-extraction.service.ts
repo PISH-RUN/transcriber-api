@@ -14,6 +14,7 @@ import {
   buildTranscriptPayload,
   cleanList,
   clampNumber,
+  dominantLanguage,
   fingerprintOf,
   itemsWithinBudget,
   parseJsonObject,
@@ -39,6 +40,52 @@ const TIMEOUT_MS = 10 * 60 * 1000;
 /** Example mentions kept per candidate, matching the prompt's own limit. */
 const MAX_EXAMPLES = 3;
 
+/**
+ * The prompt's fixed `status` values, mapped to the wording the glossary already
+ * uses for the same field. `status` on a term is free text filled in by hand and
+ * by bulk import, so an English enum sitting next to «نیازمند تأیید» would read
+ * as a different kind of thing.
+ */
+const STATUS_LABELS: Record<string, string> = {
+  confirmed: 'تأیید شده',
+  tentative: 'نیازمند تأیید',
+  disputed: 'محل اختلاف',
+};
+
+/** Statuses that mean a human has to look, whatever the model claims. */
+const STATUS_NEEDS_REVIEW = new Set(['tentative', 'disputed']);
+
+/**
+ * The prompt's own examples use generic category keys. The project's taxonomy is
+ * what actually applies, so translate the generic ones onto it — and only onto a
+ * key this project really defines.
+ */
+const CATEGORY_ALIASES: Record<string, string> = {
+  people: 'person',
+  person_: 'person',
+  organizations: 'company',
+  organization: 'company',
+  companies: 'company',
+  brands: 'brand',
+  units: 'unit',
+  roles: 'unit',
+  products: 'product',
+  services: 'product',
+  systems: 'system',
+  software: 'system',
+  projects: 'project',
+  initiatives: 'project',
+  markets: 'market',
+  countries: 'market',
+  processes: 'process',
+  technical_terms: 'term',
+  metrics: 'term',
+  frameworks: 'term',
+  concepts: 'term',
+  documents: 'other',
+  reports: 'other',
+};
+
 export interface GlossaryCandidateMention {
   segment_index: number | null;
   speaker?: string;
@@ -56,6 +103,10 @@ export interface GlossaryCandidate {
   category: string;
   category_label: string;
   definition?: string;
+  /** Settledness in the reviewer's own wording, stored on the term. */
+  status?: string;
+  /** The prompt's fixed value behind `status`, for filtering in the UI. */
+  status_key?: 'confirmed' | 'tentative' | 'disputed';
   aliases: string[];
   tags: string[];
   importance: number | null;
@@ -215,6 +266,12 @@ export class GlossaryExtractionService {
   ): string {
     const parts: string[] = [];
 
+    // The prompt takes this as an explicit input and its own fallback chain ends
+    // at English, so state it rather than letting it be inferred.
+    parts.push(
+      `output_language:\n${JSON.stringify(dominantLanguage(transcriptJson))}`,
+    );
+
     if (input.projectContext?.trim()) {
       parts.push(
         `project_context:\n${JSON.stringify(input.projectContext.trim())}`,
@@ -314,11 +371,18 @@ export class GlossaryExtractionService {
       const problems: string[] = [];
 
       const rawCategory = asText(item?.category);
+      const aliasedCategory = CATEGORY_ALIASES[rawCategory.toLowerCase()] ?? '';
       const category =
         categoryByKey.get(rawCategory) ??
+        categoryByKey.get(aliasedCategory) ??
         categoryByLabel.get(normalizeForCompare(rawCategory)) ??
         fallbackCategory;
-      if (!categoryByKey.has(rawCategory)) {
+      // Only a genuinely unrecognised category is worth flagging; a generic key
+      // that maps cleanly onto this project's taxonomy is not a problem.
+      if (
+        !category ||
+        (!categoryByKey.has(rawCategory) && !categoryByKey.has(aliasedCategory))
+      ) {
         problems.push(
           `دسته «${rawCategory || '—'}» شناسایی نشد؛ «${category?.label}» پیشنهاد شد`,
         );
@@ -355,18 +419,31 @@ export class GlossaryExtractionService {
         problems.push('نمونه‌های ارجاع مدل روی خط‌های اعلام‌شده پیدا نشد');
       }
 
+      // "tentative"/"disputed" are the prompt's way of saying a human has to
+      // decide, so they raise the review flag regardless of what it claimed.
+      const rawStatus = asText(item?.status).toLowerCase();
+      const knownStatus = rawStatus in STATUS_LABELS;
+      const status = knownStatus ? STATUS_LABELS[rawStatus] : undefined;
+
       candidates.push({
         candidate_id: candidates.length + 1,
         term,
         category: category?.key ?? 'other',
         category_label: category?.label ?? 'سایر',
         definition: asText(item?.definition) || undefined,
+        status,
+        status_key: knownStatus
+          ? (rawStatus as 'confirmed' | 'tentative' | 'disputed')
+          : undefined,
         aliases,
         tags: cleanList(item?.tags).slice(0, 5),
         importance: clampNumber(item?.importance, 1, 5),
         confidence: clampNumber(item?.confidence, 0, 1),
         // Our own checks can raise the flag even when the model was confident.
-        needs_review: item?.needs_review === true || problems.length > 0,
+        needs_review:
+          item?.needs_review === true ||
+          STATUS_NEEDS_REVIEW.has(rawStatus) ||
+          problems.length > 0,
         review_note: asText(item?.review_note) || null,
         examples,
         occurrence_count: occurrences,
@@ -445,6 +522,7 @@ export class GlossaryExtractionService {
       'definition',
       'aliases',
       'tags',
+      'status',
       'importance',
       'confidence',
       'needs_review',

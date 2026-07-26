@@ -136,6 +136,21 @@ export function parseJsonObject(raw: string): Record<string, any> {
   }
 }
 
+/**
+ * Which language the transcript is in, as a short code the prompt understands.
+ *
+ * Sent explicitly rather than left to the model: the prompt's own fallback chain
+ * ends at English, and a transcript with a lot of Latin product names could tip
+ * that guess the wrong way and produce an English glossary for a Persian project.
+ */
+export function dominantLanguage(text: string): string {
+  const sample = text.slice(0, 40000);
+  const persian = (sample.match(/[\u0600-\u06FF]/g) ?? []).length;
+  const latin = (sample.match(/[A-Za-z]/g) ?? []).length;
+  if (persian === 0 && latin === 0) return 'fa';
+  return persian >= latin ? 'fa' : 'en';
+}
+
 /** Stable identity for de-duplication and for remembering a rejection. */
 export function fingerprintOf(value: string): string {
   return normalizeForCompare(String(value ?? '')).slice(0, 255);
@@ -242,6 +257,7 @@ export interface StoredCandidate {
   confidence?: number | null;
   needs_review?: boolean;
   review_note?: string | null;
+  status_key?: 'confirmed' | 'tentative' | 'disputed';
   occurrence_count?: number;
   examples?: unknown;
 
