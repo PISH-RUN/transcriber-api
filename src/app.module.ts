@@ -9,6 +9,10 @@ import { ConfigModule } from './libs/config/config.module';
 import { UserModule } from './modules/user/user.module';
 import { FileModule } from './modules/file/file.module';
 import { PersonModule } from './modules/person/person.module';
+import { ProjectModule } from './modules/project/project.module';
+import { AnalysisModule } from './modules/analysis/analysis.module';
+import { GlossaryModule } from './modules/glossary/glossary.module';
+import { EvidenceModule } from './modules/evidence/evidence.module';
 import { TranscriptionModule } from './modules/transcription/transcription.module';
 import { APP_INTERCEPTOR } from '@nestjs/core';
 import { ResponseInterceptor } from './libs/interceptors/response.interceptor';
@@ -21,6 +25,10 @@ import { ResponseInterceptor } from './libs/interceptors/response.interceptor';
     UserModule,
     FileModule,
     PersonModule,
+    ProjectModule,
+    GlossaryModule,
+    EvidenceModule,
+    AnalysisModule,
     TranscriptionModule,
   ],
   controllers: [AppController],

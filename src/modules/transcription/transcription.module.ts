@@ -7,6 +7,8 @@ import { AiModule } from '../ai/ai.module';
 import { FileModule } from '../file/file.module';
 import { AudioModule } from '../audio/audio.module';
 import { PersonModule } from '../person/person.module';
+import { ProjectModule } from '../project/project.module';
+import { AnalysisModule } from '../analysis/analysis.module';
 
 @Module({
   imports: [
@@ -14,6 +16,8 @@ import { PersonModule } from '../person/person.module';
     FileModule,
     AudioModule,
     PersonModule,
+    ProjectModule,
+    AnalysisModule,
     AiModule,
   ],
   controllers: [TranscriptionController],

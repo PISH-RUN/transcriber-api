@@ -8,6 +8,7 @@ import {
   ParseIntPipe,
   Patch,
   Post,
+  Query,
   UploadedFiles,
   UseInterceptors,
 } from '@nestjs/common';
@@ -15,7 +16,8 @@ import { FilesInterceptor } from '@nestjs/platform-express';
 import { diskStorage } from 'multer';
 import * as fs from 'fs';
 import * as path from 'path';
-import { ApiConsumes, ApiOperation, ApiTags } from '@nestjs/swagger';
+import { ApiConsumes, ApiOperation, ApiQuery, ApiTags } from '@nestjs/swagger';
+import { TranscriptionStatus } from './transcription.entity';
 import { TranscriptionService } from './transcription.service';
 import {
   ConfirmSpeakersDto,
@@ -30,9 +32,30 @@ export class TranscriptionController {
   constructor(private readonly transcriptionService: TranscriptionService) {}
 
   @Get()
-  @ApiOperation({ summary: 'List all transcriptions' })
-  list() {
-    return this.transcriptionService.list();
+  @ApiOperation({
+    summary: 'List transcriptions, optionally filtered',
+    description:
+      'Filters: `search` (title, description, tags, project name), `project_id` (a number, or "none" for unfiled), `status` (comma-separated), `from`/`to` (YYYY-MM-DD over the session date, falling back to the upload date).',
+  })
+  @ApiQuery({ name: 'search', required: false })
+  @ApiQuery({ name: 'project_id', required: false, description: 'id یا none' })
+  @ApiQuery({ name: 'status', required: false, description: 'comma-separated' })
+  @ApiQuery({ name: 'from', required: false, example: '2026-01-01' })
+  @ApiQuery({ name: 'to', required: false, example: '2026-12-29' })
+  list(
+    @Query('search') search?: string,
+    @Query('project_id') projectId?: string,
+    @Query('status') status?: string,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+  ) {
+    return this.transcriptionService.list({
+      search,
+      projectId: this.parseProjectFilter(projectId),
+      status: this.parseStatuses(status),
+      from: from || undefined,
+      to: to || undefined,
+    });
   }
 
   @Get(':id')
@@ -86,6 +109,11 @@ export class TranscriptionController {
     @UploadedFiles() files: Express.Multer.File[],
     @Body('title') title?: string,
     @Body('expected_person_ids') expectedPersonIdsRaw?: string,
+    @Body('description') description?: string,
+    @Body('recorded_at') recordedAt?: string,
+    @Body('tags') tagsRaw?: string,
+    @Body('project_id') projectIdRaw?: string,
+    @Body('project_name') projectName?: string,
   ) {
     if (!files || files.length === 0) {
       throw new BadRequestException('حداقل یک فایل صوتی لازم است');
@@ -97,9 +125,16 @@ export class TranscriptionController {
       toUtf8(files[0].originalname).replace(/\.[^.]+$/, '') ||
       `رونویسی ${new Date().toLocaleString('fa-IR')}`;
 
+    const projectId = projectIdRaw ? parseInt(projectIdRaw, 10) : null;
+
     return this.transcriptionService.create({
       title: resolvedTitle,
       expectedPersonIds,
+      description,
+      recordedAt: recordedAt || null,
+      tags: this.parseTags(tagsRaw),
+      projectId: Number.isNaN(projectId as number) ? null : projectId,
+      projectName: projectName || null,
       files: files.map((f) => ({
         path: f.path,
         originalname: toUtf8(f.originalname),
@@ -165,6 +200,36 @@ export class TranscriptionController {
   @ApiOperation({ summary: 'Delete a transcription' })
   remove(@Param('id', ParseIntPipe) id: number) {
     return this.transcriptionService.remove(id);
+  }
+
+  /** Multipart values arrive as strings: accept a JSON array or a comma list. */
+  private parseTags(raw?: string): string[] {
+    if (!raw) return [];
+    const trimmed = raw.trim();
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) return parsed.map((v) => String(v));
+    } catch {
+      // Not JSON — fall back to comma-separated.
+    }
+    return trimmed.split(',').map((s) => s.trim());
+  }
+
+  private parseProjectFilter(raw?: string): number | 'none' | undefined {
+    if (!raw) return undefined;
+    if (raw === 'none') return 'none';
+    const parsed = parseInt(raw, 10);
+    return Number.isNaN(parsed) ? undefined : parsed;
+  }
+
+  private parseStatuses(raw?: string): TranscriptionStatus[] | undefined {
+    if (!raw) return undefined;
+    const allowed = Object.values(TranscriptionStatus) as string[];
+    const statuses = raw
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => allowed.includes(s)) as TranscriptionStatus[];
+    return statuses.length ? statuses : undefined;
   }
 
   private parsePersonIds(raw?: string): number[] {

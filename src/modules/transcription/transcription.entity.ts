@@ -7,6 +7,7 @@ import {
 } from 'typeorm';
 import { BaseTimestampEntity } from '../../common/abstracts/base.entity';
 import { FileEntity } from '../file/file.entity';
+import { Project } from '../project/project.entity';
 
 export enum TranscriptionStatus {
   PENDING = 'pending', // created, queued for processing
@@ -33,6 +34,31 @@ export interface SpeakerSample {
 export class Transcription extends BaseTimestampEntity {
   @Column({ length: 255 })
   title: string;
+
+  // --- filing / searchable metadata, captured at upload time ---------------
+
+  /** Free-text notes about the session. Searchable. */
+  @Column({ type: 'text', nullable: true })
+  description?: string | null;
+
+  /**
+   * When the session actually happened, as a calendar date — deliberately not a
+   * timestamp, so it can't drift across timezones. `created_at` remains the
+   * upload time.
+   */
+  @Column({ type: 'date', nullable: true })
+  recorded_at?: string | null;
+
+  /** Short free-form labels for filtering (e.g. ["جلسه هفتگی", "قطران"]). */
+  @Column({ type: 'jsonb', nullable: true })
+  tags?: string[] | null;
+
+  /** The project this recording is filed under, if any. */
+  @Column({ type: 'int', nullable: true })
+  project_id?: number | null;
+  @ManyToOne(() => Project, { nullable: true, onDelete: 'SET NULL' })
+  @JoinColumn({ name: 'project_id' })
+  project?: Project | null;
 
   @Column({
     type: 'enum',

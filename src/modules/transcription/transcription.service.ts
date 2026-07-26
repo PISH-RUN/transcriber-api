@@ -10,6 +10,8 @@ import {
 } from './transcription.entity';
 import { FileService } from '../file/file.service';
 import { PersonService } from '../person/person.service';
+import { ProjectService } from '../project/project.service';
+import { AnalysisService } from '../analysis/analysis.service';
 import { TranscriptRefineService } from '../ai/transcript-refine.service';
 import { AudioProcessorService } from '../audio/audio-processor.service';
 import { SonioxClientService } from '../audio/soniox-client.service';
@@ -27,6 +29,25 @@ export interface CreateTranscriptionInput {
   title: string;
   expectedPersonIds: number[];
   files: Array<{ path: string; originalname: string }>;
+  description?: string | null;
+  /** Calendar date the session happened, "YYYY-MM-DD". */
+  recordedAt?: string | null;
+  tags?: string[];
+  /** File under an existing project… */
+  projectId?: number | null;
+  /** …or under a project named here, created on the fly if it's new. */
+  projectName?: string | null;
+}
+
+/** Filters accepted by the list endpoint. */
+export interface ListTranscriptionsFilter {
+  search?: string;
+  /** Project id, or the string 'none' for "not filed under any project". */
+  projectId?: number | 'none';
+  status?: TranscriptionStatus[];
+  /** Inclusive date range over the session date (falling back to upload date). */
+  from?: string;
+  to?: string;
 }
 
 @Injectable()
@@ -45,6 +66,8 @@ export class TranscriptionService {
     private readonly pyannote: PyannoteService,
     private readonly merger: TranscriptMergerService,
     private readonly refiner: TranscriptRefineService,
+    private readonly projectService: ProjectService,
+    private readonly analysisService: AnalysisService,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -60,12 +83,21 @@ export class TranscriptionService {
       throw new HttpException('حداقل یک فایل صوتی لازم است', 400);
     }
 
+    const projectId = await this.resolveProjectId(
+      input.projectId,
+      input.projectName,
+    );
+
     const transcription = await this.transcriptionRepo.save(
       this.transcriptionRepo.create({
         title: input.title,
         status: TranscriptionStatus.PENDING,
         status_message: 'در صف پردازش',
         expected_person_ids: input.expectedPersonIds ?? [],
+        description: input.description?.trim() || null,
+        recorded_at: input.recordedAt || null,
+        tags: this.normalizeTags(input.tags),
+        project_id: projectId,
       }),
     );
 
@@ -99,13 +131,22 @@ export class TranscriptionService {
     return transcription;
   }
 
-  async list(): Promise<Transcription[]> {
-    // Avoid pulling the large text/segment/token columns in the list view.
-    return this.transcriptionRepo
+  /**
+   * List view, filtered server-side so finding one recording among hundreds
+   * doesn't depend on shipping the whole table to the browser. The large
+   * text/segment/token columns are never selected here.
+   */
+  async list(filter: ListTranscriptionsFilter = {}): Promise<Transcription[]> {
+    const query = this.transcriptionRepo
       .createQueryBuilder('t')
+      .leftJoin('t.project', 'p')
       .select([
         't.id',
         't.title',
+        't.description',
+        't.recorded_at',
+        't.tags',
+        't.project_id',
         't.status',
         't.status_message',
         't.duration',
@@ -113,9 +154,48 @@ export class TranscriptionService {
         't.expected_person_ids',
         't.created_at',
         't.updated_at',
-      ])
-      .orderBy('t.created_at', 'DESC')
-      .getMany();
+        'p.id',
+        'p.name',
+        'p.color',
+      ]);
+
+    const search = filter.search?.trim();
+    if (search) {
+      // `tags` is jsonb — cast to text so a tag substring is searchable too.
+      query.andWhere(
+        `(t.title ILIKE :q OR t.description ILIKE :q OR p.name ILIKE :q OR CAST(t.tags AS TEXT) ILIKE :q)`,
+        { q: `%${search}%` },
+      );
+    }
+
+    if (filter.projectId === 'none') {
+      query.andWhere('t.project_id IS NULL');
+    } else if (typeof filter.projectId === 'number') {
+      query.andWhere('t.project_id = :projectId', {
+        projectId: filter.projectId,
+      });
+    }
+
+    if (filter.status?.length) {
+      query.andWhere('t.status IN (:...statuses)', {
+        statuses: filter.status,
+      });
+    }
+
+    // Filter on the session date, falling back to the upload date for
+    // recordings that were uploaded without one.
+    if (filter.from) {
+      query.andWhere('COALESCE(t.recorded_at, t.created_at::date) >= :from', {
+        from: filter.from,
+      });
+    }
+    if (filter.to) {
+      query.andWhere('COALESCE(t.recorded_at, t.created_at::date) <= :to', {
+        to: filter.to,
+      });
+    }
+
+    return query.orderBy('t.created_at', 'DESC').getMany();
   }
 
   /** Full detail with presigned playback URLs for the audio + speaker clips. */
@@ -192,7 +272,14 @@ export class TranscriptionService {
    */
   async update(
     id: number,
-    dto: { title?: string; segments?: Transcription['segments'] },
+    dto: {
+      title?: string;
+      description?: string | null;
+      recorded_at?: string | null;
+      tags?: string[] | null;
+      project_id?: number | null;
+      segments?: Transcription['segments'];
+    },
   ): Promise<any> {
     const t = await this.transcriptionRepo.findOne({ where: { id } });
     if (!t) throw new HttpException('رونویسی یافت نشد', 404);
@@ -201,6 +288,19 @@ export class TranscriptionService {
 
     if (dto.title !== undefined) {
       patch.title = dto.title;
+    }
+    if (dto.description !== undefined) {
+      patch.description = dto.description?.trim() || null;
+    }
+    if (dto.recorded_at !== undefined) {
+      patch.recorded_at = dto.recorded_at || null;
+    }
+    if (dto.tags !== undefined) {
+      patch.tags = this.normalizeTags(dto.tags ?? undefined);
+    }
+    if (dto.project_id !== undefined) {
+      patch.project_id =
+        dto.project_id == null ? null : (await this.projectService.findById(dto.project_id)).id;
     }
 
     if (dto.segments !== undefined) {
@@ -214,6 +314,12 @@ export class TranscriptionService {
 
     if (Object.keys(patch).length > 0) {
       await this.transcriptionRepo.update(id, patch);
+    }
+
+    // Analyses carry a denormalized project id for taxonomy counting; keep it
+    // in step when the recording is re-filed.
+    if (dto.project_id !== undefined) {
+      await this.analysisService.syncProject(id, patch.project_id ?? null);
     }
 
     return this.getDetail(id);
@@ -989,6 +1095,34 @@ export class TranscriptionService {
       .where('t.id = :id', { id })
       .getOne();
     return t?.expected_person_ids ?? [];
+  }
+
+  /** Trim, drop blanks and de-duplicate tags; an empty list is stored as null. */
+  private normalizeTags(tags?: string[] | null): string[] | null {
+    if (!tags?.length) return null;
+    const cleaned = [
+      ...new Set(tags.map((tag) => String(tag).trim()).filter(Boolean)),
+    ];
+    return cleaned.length ? cleaned : null;
+  }
+
+  /**
+   * An upload either points at an existing project, or names one — in which
+   * case it is created now so the user doesn't have to set it up beforehand.
+   */
+  private async resolveProjectId(
+    projectId?: number | null,
+    projectName?: string | null,
+  ): Promise<number | null> {
+    if (projectId != null) {
+      const project = await this.projectService.findById(projectId);
+      return project.id;
+    }
+    if (projectName?.trim()) {
+      const project = await this.projectService.findOrCreateByName(projectName);
+      return project.id;
+    }
+    return null;
   }
 
   private async safePresign(s3Key?: string | null): Promise<string | null> {

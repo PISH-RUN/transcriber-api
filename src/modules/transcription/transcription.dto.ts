@@ -69,6 +69,39 @@ export class UpdateTranscriptionDto {
   @IsString()
   title?: string;
 
+  @ApiProperty({ required: false, description: 'توضیحات جلسه' })
+  @IsOptional()
+  @IsString()
+  description?: string | null;
+
+  @ApiProperty({
+    required: false,
+    example: '2026-07-25',
+    description: 'تاریخ برگزاری جلسه (میلادی، YYYY-MM-DD)',
+  })
+  @IsOptional()
+  @IsString()
+  recorded_at?: string | null;
+
+  @ApiProperty({
+    required: false,
+    type: [String],
+    description: 'برچسب‌ها برای جستجو و فیلتر',
+  })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  tags?: string[] | null;
+
+  @ApiProperty({
+    required: false,
+    nullable: true,
+    description: 'شناسه پروژه (null یعنی بدون پروژه)',
+  })
+  @IsOptional()
+  @IsInt()
+  project_id?: number | null;
+
   @ApiProperty({
     required: false,
     type: [UpdateSegmentDto],
