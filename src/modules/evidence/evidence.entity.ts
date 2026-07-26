@@ -140,6 +140,44 @@ export class EvidenceItem extends BaseTimestampEntity {
   @Column({ default: false })
   contains_interviewer_text: boolean;
 
+  /**
+   * What the item is *for*: `organizational_current_state`, `project_governance`,
+   * `product_requirement`, `stakeholder_expectation`, `historical_context`.
+   *
+   * Separate from `type`, which says what kind of statement it is. A meeting that
+   * mixes a product pitch with client-specific discussion produces both, and
+   * without this the two are indistinguishable in the basket.
+   */
+  @Column({ type: 'varchar', length: 48, nullable: true })
+  evidence_scope?: string | null;
+
+  /**
+   * How settled the statement is among the participants:
+   * `single_speaker_claim`, `proposal`, `tentative_agreement`,
+   * `confirmed_agreement`, `disputed`, `not_applicable`.
+   *
+   * Kept apart from `type` on purpose: a `decision` can still be a
+   * `tentative_agreement`, and treating the two as one field is how a discussion
+   * quietly becomes a commitment.
+   */
+  @Column({ type: 'varchar', length: 32, nullable: true })
+  agreement_status?: string | null;
+
+  /**
+   * The passage is an illustrative "suppose that…", not a statement about how the
+   * organization actually works. Losing this distinction turns an example into a
+   * policy, which is the most damaging error this pipeline can make.
+   */
+  @Column({ default: false })
+  is_hypothetical_example: boolean;
+
+  @Column({ default: false })
+  follow_up_required: boolean;
+
+  /** The concrete next step this item creates, if any. */
+  @Column({ type: 'text', nullable: true })
+  follow_up_action?: string | null;
+
   /** Hand-picked, bulk-imported, or proposed by an AI extraction run. */
   @Column({ type: 'varchar', length: 16, default: 'manual' })
   origin: 'manual' | 'import' | 'ai';

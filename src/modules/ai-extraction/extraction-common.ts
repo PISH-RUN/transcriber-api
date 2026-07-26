@@ -125,6 +125,14 @@ export function parseJsonObject(raw: string): Record<string, any> {
   try {
     return JSON.parse(body) as Record<string, unknown>;
   } catch (error: unknown) {
+    // A raw newline or tab inside a string is the most common way a long answer
+    // breaks, and it is fully repairable.
+    try {
+      return JSON.parse(escapeControlChars(body)) as Record<string, unknown>;
+    } catch {
+      /* fall through to the real error */
+    }
+
     // A valid prefix that fails to parse at the very end is the signature of a
     // truncated response.
     const looksTruncated = !cleaned.trimEnd().endsWith('}');
@@ -134,6 +142,115 @@ export function parseJsonObject(raw: string): Record<string, any> {
         : `پاسخ مدل JSON معتبر نبود: ${errorMessage(error)} (${size})`,
     );
   }
+}
+
+/** Escape the control characters JSON forbids inside string literals. */
+function escapeControlChars(json: string): string {
+  const out: string[] = [];
+  let inString = false;
+  let escaped = false;
+
+  for (const char of json) {
+    if (escaped) {
+      out.push(char);
+      escaped = false;
+      continue;
+    }
+    if (char === '\\' && inString) {
+      out.push(char);
+      escaped = true;
+      continue;
+    }
+    if (char === '"') {
+      inString = !inString;
+      out.push(char);
+      continue;
+    }
+    if (inString && char < ' ') {
+      out.push(
+        char === '\n'
+          ? '\\n'
+          : char === '\r'
+            ? '\\r'
+            : char === '\t'
+              ? '\\t'
+              : ' ',
+      );
+      continue;
+    }
+    out.push(char);
+  }
+
+  return out.join('');
+}
+
+/**
+ * Recover the individual items of one array out of a response that JSON.parse
+ * rejects as a whole.
+ *
+ * A single stray character in item 23 otherwise costs the entire run: these
+ * responses run to 100k characters and take two and a half minutes of paid
+ * inference, and the other 41 items in them are perfectly good. So the array is
+ * split on brace depth (string-aware, so braces inside quoted Persian text do
+ * not count) and each element is parsed on its own; the broken ones are the only
+ * thing lost.
+ */
+export function salvageItems(
+  raw: string,
+  key: string,
+): Record<string, unknown>[] {
+  const keyAt = raw.indexOf(`"${key}"`);
+  if (keyAt === -1) return [];
+
+  const arrayAt = raw.indexOf('[', keyAt);
+  if (arrayAt === -1) return [];
+
+  const items: Record<string, unknown>[] = [];
+  let depth = 0;
+  let objectStart = -1;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = arrayAt + 1; i < raw.length; i += 1) {
+    const char = raw[i];
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (inString) {
+      if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (char === '{') {
+      if (depth === 0) objectStart = i;
+      depth += 1;
+    } else if (char === '}') {
+      depth -= 1;
+      if (depth === 0 && objectStart !== -1) {
+        const body = raw.slice(objectStart, i + 1);
+        try {
+          const parsed: unknown = JSON.parse(escapeControlChars(body));
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            items.push(parsed as Record<string, unknown>);
+          }
+        } catch {
+          /* this one item is lost; the rest are not */
+        }
+        objectStart = -1;
+      }
+    } else if (char === ']' && depth === 0) {
+      break;
+    }
+  }
+
+  return items;
 }
 
 /**
@@ -276,6 +393,11 @@ export interface StoredCandidate {
   quoted_from_another_person?: boolean;
   referenced_people?: string[];
   contains_interviewer_text?: boolean;
+  evidence_scope?: string | null;
+  agreement_status?: string | null;
+  is_hypothetical_example?: boolean;
+  follow_up_required?: boolean;
+  follow_up_action?: string | null;
   anchored?: boolean;
   coverage?: number | null;
   segment_index?: number | null;

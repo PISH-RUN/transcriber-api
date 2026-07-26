@@ -14,6 +14,28 @@ import {
 } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 
+/**
+ * Fixed vocabularies from the evidence-extraction prompt. Unlike `type`, these
+ * are not per-project taxonomy: they describe the *shape* of a statement, which
+ * is the same in every project, so they are validated as an enum.
+ */
+export const EVIDENCE_SCOPES = [
+  'organizational_current_state',
+  'project_governance',
+  'product_requirement',
+  'stakeholder_expectation',
+  'historical_context',
+] as const;
+
+export const AGREEMENT_STATUSES = [
+  'single_speaker_claim',
+  'proposal',
+  'tentative_agreement',
+  'confirmed_agreement',
+  'disputed',
+  'not_applicable',
+] as const;
+
 export class CreateEvidenceDto {
   @ApiProperty({ description: 'پروژه‌ای که شواهد به آن اضافه می‌شود' })
   @IsInt()
@@ -178,6 +200,43 @@ export class CreateEvidenceDto {
 
   @ApiProperty({
     required: false,
+    enum: EVIDENCE_SCOPES,
+    description:
+      'این شاهد برای چه کاری است: وضع موجود، حاکمیت پروژه، نیاز محصول، …',
+  })
+  @IsOptional()
+  @IsIn(EVIDENCE_SCOPES)
+  evidence_scope?: string;
+
+  @ApiProperty({
+    required: false,
+    enum: AGREEMENT_STATUSES,
+    description: 'میزان توافق شرکت‌کنندگان روی این گفته',
+  })
+  @IsOptional()
+  @IsIn(AGREEMENT_STATUSES)
+  agreement_status?: string;
+
+  @ApiProperty({
+    required: false,
+    description: 'مثال فرضی است، نه گزارشی از وضع واقعی سازمان',
+  })
+  @IsOptional()
+  @IsBoolean()
+  is_hypothetical_example?: boolean;
+
+  @ApiProperty({ required: false })
+  @IsOptional()
+  @IsBoolean()
+  follow_up_required?: boolean;
+
+  @ApiProperty({ required: false, description: 'اقدام بعدی مشخص' })
+  @IsOptional()
+  @IsString()
+  follow_up_action?: string;
+
+  @ApiProperty({
+    required: false,
     type: [Number],
     description: 'واژه‌های دیکشنری که این شاهد درباره‌شان است',
   })
@@ -302,6 +361,31 @@ export class UpdateEvidenceDto {
   @IsArray()
   @IsInt({ each: true })
   term_ids?: number[];
+
+  @ApiProperty({ required: false, enum: EVIDENCE_SCOPES })
+  @IsOptional()
+  @IsIn(EVIDENCE_SCOPES)
+  evidence_scope?: string | null;
+
+  @ApiProperty({ required: false, enum: AGREEMENT_STATUSES })
+  @IsOptional()
+  @IsIn(AGREEMENT_STATUSES)
+  agreement_status?: string | null;
+
+  @ApiProperty({ required: false })
+  @IsOptional()
+  @IsBoolean()
+  is_hypothetical_example?: boolean;
+
+  @ApiProperty({ required: false })
+  @IsOptional()
+  @IsBoolean()
+  follow_up_required?: boolean;
+
+  @ApiProperty({ required: false })
+  @IsOptional()
+  @IsString()
+  follow_up_action?: string | null;
 }
 
 export class ImportEvidenceDto {

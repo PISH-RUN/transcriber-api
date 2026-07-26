@@ -18,6 +18,7 @@ import {
   fingerprintOf,
   itemsWithinBudget,
   parseJsonObject,
+  salvageItems,
 } from './extraction-common';
 
 /**
@@ -211,7 +212,7 @@ export class GlossaryExtractionService {
       raw = await this.ask(user + budgetInstruction(budget, cap), budget);
     }
 
-    const parsed = this.parse(raw);
+    const parsed = this.parse(raw, notes);
     const proposed = (
       Array.isArray(parsed?.new_terms) ? parsed.new_terms : []
     ) as RawGlossaryCandidate[];
@@ -248,15 +249,29 @@ export class GlossaryExtractionService {
    * Parse the response, logging its tail when it fails. A malformed extraction
    * response is almost always a truncation or a stray wrapper, and both are
    * invisible from the error alone — the last few hundred characters say which.
+   *
+   * When the whole object will not parse, the terms are recovered one by one:
+   * losing the one malformed entry costs far less than losing the run.
    */
-  private parse(raw: string): Record<string, unknown> {
+  private parse(raw: string, notes: string[]): Record<string, unknown> {
     try {
       return parseJsonObject(raw);
     } catch (error) {
       this.logger.error(
         `Glossary extraction response unusable (${raw.length} chars). Tail: ${raw.slice(-400)}`,
       );
-      throw error;
+
+      const salvaged = salvageItems(raw, 'new_terms');
+      if (salvaged.length === 0) throw error;
+
+      this.logger.warn(
+        `Salvaged ${salvaged.length} glossary candidate(s) from an unparseable response`,
+      );
+      notes.push(
+        `پاسخ مدل کامل خوانده نشد، ولی ${salvaged.length} واژه از آن بازیابی شد. ` +
+          `ممکن است چند مورد جا افتاده باشد؛ در صورت نیاز اجرا را تکرار کنید.`,
+      );
+      return { new_terms: salvaged };
     }
   }
 

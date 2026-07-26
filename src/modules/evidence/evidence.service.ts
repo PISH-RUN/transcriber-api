@@ -57,7 +57,7 @@ export class EvidenceService {
     }
     if (filter.search?.trim()) {
       query.andWhere(
-        '(e.quote ILIKE :q OR e.note ILIKE :q OR e.title ILIKE :q OR e.verification ILIKE :q OR CAST(e.tags AS TEXT) ILIKE :q)',
+        '(e.quote ILIKE :q OR e.note ILIKE :q OR e.title ILIKE :q OR e.verification ILIKE :q OR e.claim_summary ILIKE :q OR e.follow_up_action ILIKE :q OR CAST(e.tags AS TEXT) ILIKE :q)',
         { q: `%${filter.search.trim()}%` },
       );
     }
@@ -124,6 +124,14 @@ export class EvidenceService {
         quoted_from_another_person: dto.quoted_from_another_person ?? false,
         referenced_people: this.normalizeTags(dto.referenced_people),
         contains_interviewer_text: dto.contains_interviewer_text ?? false,
+        evidence_scope: dto.evidence_scope || null,
+        agreement_status: dto.agreement_status || null,
+        is_hypothetical_example: dto.is_hypothetical_example ?? false,
+        // A follow-up without an action is a reminder to no one, so the flag is
+        // only true when there is something concrete to do.
+        follow_up_action: dto.follow_up_action?.trim() || null,
+        follow_up_required:
+          (dto.follow_up_required ?? false) && !!dto.follow_up_action?.trim(),
         origin: dto.origin ?? 'manual',
         ai_meta: dto.ai_meta ?? null,
       }),
@@ -186,6 +194,22 @@ export class EvidenceService {
     }
     if (dto.referenced_people !== undefined) {
       item.referenced_people = this.normalizeTags(dto.referenced_people);
+    }
+    if (dto.evidence_scope !== undefined) {
+      item.evidence_scope = dto.evidence_scope || null;
+    }
+    if (dto.agreement_status !== undefined) {
+      item.agreement_status = dto.agreement_status || null;
+    }
+    if (dto.is_hypothetical_example !== undefined) {
+      item.is_hypothetical_example = dto.is_hypothetical_example;
+    }
+    if (dto.follow_up_action !== undefined) {
+      item.follow_up_action = dto.follow_up_action?.trim() || null;
+      item.follow_up_required = !!item.follow_up_action;
+    }
+    if (dto.follow_up_required !== undefined && !dto.follow_up_required) {
+      item.follow_up_required = false;
     }
 
     await this.evidenceRepo.save(item);

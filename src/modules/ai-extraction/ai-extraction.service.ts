@@ -243,6 +243,9 @@ export class AiExtractionService {
           warnings: output.warnings,
           // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
           coverage: (output.coverage ?? null) as any,
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+          source_characterization: (output.sourceCharacterization ??
+            null) as any,
           prompt_chars: output.promptChars,
           response_chars: output.responseChars,
           duration_ms: Date.now() - startedAt,
@@ -452,6 +455,11 @@ export class AiExtractionService {
             'end_segment_index',
             'requires_validation',
             'comparison_potential',
+            'evidence_scope',
+            'agreement_status',
+            'is_hypothetical_example',
+            'follow_up_required',
+            'follow_up_action',
           ];
 
     const merged: Record<string, unknown> = { ...candidate };
@@ -523,6 +531,11 @@ export class AiExtractionService {
         ? candidate.referenced_people
         : undefined,
       contains_interviewer_text: candidate.contains_interviewer_text === true,
+      evidence_scope: candidate.evidence_scope || undefined,
+      agreement_status: candidate.agreement_status || undefined,
+      is_hypothetical_example: candidate.is_hypothetical_example === true,
+      follow_up_required: candidate.follow_up_required === true,
+      follow_up_action: candidate.follow_up_action || undefined,
       term_ids: Array.isArray(candidate.term_ids)
         ? candidate.term_ids
         : undefined,

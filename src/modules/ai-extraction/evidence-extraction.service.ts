@@ -2,6 +2,10 @@ import { Injectable, Logger } from '@nestjs/common';
 import { GeminiService, LlmOutputBudgetError } from '../ai/gemini.service';
 import { PromptService } from '../ai/prompt.service';
 import { EvidenceItem } from '../evidence/evidence.entity';
+import {
+  AGREEMENT_STATUSES as AGREEMENT_STATUS_VALUES,
+  EVIDENCE_SCOPES as EVIDENCE_SCOPE_VALUES,
+} from '../evidence/evidence.dto';
 import { GlossaryTerm } from '../glossary/glossary.entity';
 import { ProjectCategory } from '../project/project-category.entity';
 import {
@@ -19,9 +23,11 @@ import {
   buildTranscriptPayload,
   cleanList,
   clampNumber,
+  dominantLanguage,
   fingerprintOf,
   itemsWithinBudget,
   parseJsonObject,
+  salvageItems,
   speakerNameOf,
   timeToMs,
 } from './extraction-common';
@@ -50,6 +56,23 @@ const RELIABLE_COVERAGE = 0.9;
  * punctuation; taking the real text guarantees the stored quote is exact.
  */
 const VERBATIM_COVERAGE = 0.99;
+
+/** Fixed vocabularies of the prompt; anything else is dropped, not stored. */
+const EVIDENCE_SCOPES = new Set<string>(EVIDENCE_SCOPE_VALUES);
+const AGREEMENT_STATUSES = new Set<string>(AGREEMENT_STATUS_VALUES);
+
+const MEETING_TYPES = new Set([
+  'interview',
+  'presentation',
+  'presentation_and_discussion',
+  'project_kickoff',
+  'workshop',
+  'process_walkthrough',
+  'management_meeting',
+  'focus_group',
+  'mixed',
+  'unknown',
+]);
 
 const SENSITIVITIES = new Set([
   'normal',
@@ -111,6 +134,13 @@ export interface EvidenceCandidate {
   contains_interviewer_text: boolean;
   sensitivity?: string | null;
 
+  // --- prompt v2 classification -------------------------------------------
+  evidence_scope?: string | null;
+  agreement_status?: string | null;
+  is_hypothetical_example: boolean;
+  follow_up_required: boolean;
+  follow_up_action?: string | null;
+
   // --- our own verification of where this actually sits -------------------
   anchored: boolean;
   coverage: number | null;
@@ -134,6 +164,8 @@ export interface EvidenceExtractionOutput {
   candidates: EvidenceCandidate[];
   warnings: string[];
   coverage: Record<string, unknown> | null;
+  /** What kind of session this was, as the model characterised it. */
+  sourceCharacterization: { meeting_type: string; description?: string } | null;
   promptChars: number;
   responseChars: number;
   model: string;
@@ -222,7 +254,7 @@ export class EvidenceExtractionService {
       raw = await this.ask(user + budgetInstruction(budget, cap), budget);
     }
 
-    const parsed = this.parse(raw);
+    const parsed = this.parse(raw, notes);
     const proposed = (
       Array.isArray(parsed?.evidence_candidates)
         ? parsed.evidence_candidates
@@ -230,6 +262,17 @@ export class EvidenceExtractionService {
     ) as RawEvidenceCandidate[];
 
     const candidates = this.verify(proposed, input);
+
+    // The prompt caps importance 5 at roughly a quarter of the items. When the
+    // model blows past that, the ranking has stopped separating anything, and the
+    // reviewer should know before they trust the order.
+    const top = candidates.filter((item) => item.importance === 5).length;
+    if (candidates.length >= 8 && top > candidates.length * 0.35) {
+      notes.push(
+        `${top} مورد از ${candidates.length} شاهد اهمیت ۵ گرفته‌اند؛ ` +
+          `رتبه‌بندی مدل در این اجرا متورم است و بهتر است خودتان اهمیت‌ها را بازبینی کنید.`,
+      );
+    }
 
     this.logger.log(
       `Evidence extraction: ${proposed.length} proposed -> ${candidates.length} kept ` +
@@ -243,6 +286,7 @@ export class EvidenceExtractionService {
         parsed?.coverage && typeof parsed.coverage === 'object'
           ? (parsed.coverage as Record<string, unknown>)
           : null,
+      sourceCharacterization: this.readCharacterization(parsed),
       promptChars: user.length,
       responseChars: raw.length,
       model: this.gemini.model,
@@ -262,15 +306,54 @@ export class EvidenceExtractionService {
     });
   }
 
-  /** Parse the response, logging its tail when it fails. */
-  private parse(raw: string): Record<string, unknown> {
+  /**
+   * What kind of session the model thinks this was.
+   *
+   * Worth keeping: a product pitch and a diagnostic interview should not be read
+   * the same way later, and the prompt uses this to stop presentation material
+   * from being taken as organizational fact.
+   */
+  private readCharacterization(
+    parsed: Record<string, unknown>,
+  ): { meeting_type: string; description?: string } | null {
+    const raw = parsed?.source_characterization;
+    if (!raw || typeof raw !== 'object') return null;
+
+    const source = raw as Record<string, unknown>;
+    const type = asText(source.meeting_type).toLowerCase();
+
+    return {
+      meeting_type: MEETING_TYPES.has(type) ? type : 'unknown',
+      description: asText(source.description) || undefined,
+    };
+  }
+
+  /**
+   * Parse the response, salvaging what can be salvaged.
+   *
+   * Observed on a real run: 100k characters of good output thrown away because
+   * one item somewhere in the middle was malformed. Item-by-item recovery turns
+   * that from a lost run into a slightly shorter list plus a warning.
+   */
+  private parse(raw: string, notes: string[]): Record<string, unknown> {
     try {
       return parseJsonObject(raw);
     } catch (error) {
       this.logger.error(
         `Evidence extraction response unusable (${raw.length} chars). Tail: ${raw.slice(-400)}`,
       );
-      throw error;
+
+      const salvaged = salvageItems(raw, 'evidence_candidates');
+      if (salvaged.length === 0) throw error;
+
+      this.logger.warn(
+        `Salvaged ${salvaged.length} evidence candidate(s) from an unparseable response`,
+      );
+      notes.push(
+        `پاسخ مدل کامل خوانده نشد، ولی ${salvaged.length} شاهد از آن بازیابی شد. ` +
+          `ممکن است چند مورد جا افتاده باشد؛ در صورت نیاز اجرا را تکرار کنید.`,
+      );
+      return { evidence_candidates: salvaged };
     }
   }
 
@@ -279,6 +362,11 @@ export class EvidenceExtractionService {
     transcriptJson: string,
   ): string {
     const parts: string[] = [];
+
+    // Stated explicitly: the prompt's own fallback chain ends at English.
+    parts.push(
+      `output_language:\n${JSON.stringify(dominantLanguage(transcriptJson))}`,
+    );
 
     if (input.projectContext?.trim()) {
       parts.push(
@@ -444,6 +532,35 @@ export class EvidenceExtractionService {
         ? sensitivityRaw
         : null;
 
+      const scopeRaw = asText(item?.evidence_scope).toLowerCase();
+      const scope = EVIDENCE_SCOPES.has(scopeRaw) ? scopeRaw : null;
+
+      const agreementRaw = asText(item?.agreement_status).toLowerCase();
+      const agreement = AGREEMENT_STATUSES.has(agreementRaw)
+        ? agreementRaw
+        : null;
+
+      const hypothetical = item?.is_hypothetical_example === true;
+      const followUpAction = asText(item?.follow_up_action);
+      // The prompt asks for specifics; "بررسی شود" is not a follow-up. A stub is
+      // dropped so the follow-up list stays a list of real next steps.
+      const usableFollowUp =
+        item?.follow_up_required === true && followUpAction.length >= 15;
+
+      if (item?.follow_up_required === true && !usableFollowUp) {
+        problems.push('اقدام بعدی مشخص نبود و ثبت نشد');
+      }
+      // An example dressed up as an organizational fact is the worst failure this
+      // pipeline can produce, so it is surfaced rather than just stored.
+      if (hypothetical) {
+        problems.push('این مورد مثال فرضی است، نه گزارشی از وضع واقعی سازمان');
+      }
+      if (agreement === 'confirmed_agreement') {
+        problems.push(
+          'به‌عنوان «توافق قطعی» علامت خورده؛ ارزش یک بار تأیید دارد',
+        );
+      }
+
       // Glossary links: canonical terms only, and only ones this project has.
       const termIds: number[] = [];
       const termLabels: string[] = [];
@@ -487,6 +604,12 @@ export class EvidenceExtractionService {
         contains_interviewer_text:
           item?.source?.contains_interviewer_text === true,
         sensitivity,
+
+        evidence_scope: scope,
+        agreement_status: agreement,
+        is_hypothetical_example: hypothetical,
+        follow_up_required: usableFollowUp,
+        follow_up_action: usableFollowUp ? followUpAction : null,
 
         anchored: located.anchored,
         coverage: located.coverage,
@@ -639,6 +762,11 @@ export class EvidenceExtractionService {
       'quoted_from_another_person',
       'referenced_people',
       'sensitivity',
+      'evidence_scope',
+      'agreement_status',
+      'is_hypothetical_example',
+      'follow_up_required',
+      'follow_up_action',
     ]);
     const rest: Record<string, unknown> = {};
     Object.keys(item ?? {}).forEach((key) => {

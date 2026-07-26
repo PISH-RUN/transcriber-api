@@ -74,6 +74,16 @@ export class AiExtractionRun extends BaseTimestampEntity {
   @Column({ type: 'jsonb', nullable: true })
   coverage?: Record<string, unknown> | null;
 
+  /**
+   * Evidence runs only: what kind of session this was (`interview`,
+   * `presentation_and_discussion`, …) plus a one-line description.
+   *
+   * Kept because a product pitch and a diagnostic interview must not be read the
+   * same way months later, when nobody remembers which this was.
+   */
+  @Column({ type: 'jsonb', nullable: true })
+  source_characterization?: Record<string, unknown> | null;
+
   @Column({ type: 'int', default: 0 })
   accepted_count: number;
 
