@@ -27,12 +27,18 @@ export class PromptService {
   private readonly logger = new Logger(PromptService.name);
   private readonly cache = new Map<string, { mtimeMs: number; text: string }>();
 
-  /** Directories to look in, in order of preference. */
+  /**
+   * Directories to look in, in order of preference.
+   *
+   * Source first, on purpose: it is the file a person edits, so preferring it
+   * means a prompt change takes effect without a rebuild. `nest build` copies the
+   * same files into `dist` as a fallback for images that ship only the build
+   * output — the content is identical either way.
+   */
   private readonly roots = [
+    path.join(process.cwd(), 'src', 'prompts'),
     // Compiled output (nest-cli copies prompts/*.md into dist).
     path.join(__dirname, '..', '..', 'prompts'),
-    // Running from source (ts-node / start:dev before assets are copied).
-    path.join(process.cwd(), 'src', 'prompts'),
     path.join(process.cwd(), 'dist', 'prompts'),
   ];
 

@@ -4,7 +4,6 @@
   "sourceRoot": "src",
   "compilerOptions": {
     "deleteOutDir": true,
-    "assets": [{ "include": "prompts/*.md", "outDir": "dist" }],
-    "watchAssets": true
+    "assets": [{ "include": "prompts/*.md", "outDir": "dist" }]
   }
 }
