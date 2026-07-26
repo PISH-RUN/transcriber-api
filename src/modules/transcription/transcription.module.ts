@@ -9,6 +9,7 @@ import { AudioModule } from '../audio/audio.module';
 import { PersonModule } from '../person/person.module';
 import { ProjectModule } from '../project/project.module';
 import { AnalysisModule } from '../analysis/analysis.module';
+import { GlossaryModule } from '../glossary/glossary.module';
 
 @Module({
   imports: [
@@ -19,6 +20,9 @@ import { AnalysisModule } from '../analysis/analysis.module';
     ProjectModule,
     AnalysisModule,
     AiModule,
+    // For the automatic glossary scan after processing. GlossaryModule pulls in
+    // the Transcription entity, not this module, so there is no cycle.
+    GlossaryModule,
   ],
   controllers: [TranscriptionController],
   providers: [TranscriptionService],

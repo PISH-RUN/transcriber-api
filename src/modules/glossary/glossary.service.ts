@@ -38,7 +38,7 @@ export class GlossaryService {
 
     if (filter.search?.trim()) {
       query.andWhere(
-        '(t.term ILIKE :q OR t.description ILIKE :q OR CAST(t.aliases AS TEXT) ILIKE :q OR CAST(t.tags AS TEXT) ILIKE :q)',
+        '(t.term ILIKE :q OR t.description ILIKE :q OR t.status ILIKE :q OR CAST(t.aliases AS TEXT) ILIKE :q OR CAST(t.tags AS TEXT) ILIKE :q)',
         { q: `%${filter.search.trim()}%` },
       );
     }
@@ -82,6 +82,15 @@ export class GlossaryService {
       if (dto.description?.trim() && !term.description) {
         term.description = dto.description.trim();
       }
+      // A status already set by hand outranks whatever a bulk import carries.
+      if (dto.status?.trim() && !term.status) {
+        term.status = dto.status.trim();
+      }
+      // Merging into an existing entry keeps the higher importance: the term
+      // has now been seen in one more place, which never makes it less central.
+      if (dto.importance != null) {
+        term.importance = Math.max(term.importance ?? 0, dto.importance);
+      }
       term = await this.termRepo.save(term);
     } else {
       term = await this.termRepo.save(
@@ -92,6 +101,13 @@ export class GlossaryService {
           aliases: this.mergeList(null, dto.aliases),
           tags: this.mergeList(null, dto.tags),
           description: dto.description?.trim() || null,
+          status: dto.status?.trim() || null,
+          origin: dto.origin ?? 'manual',
+          importance: dto.importance ?? null,
+          confidence: dto.confidence ?? null,
+          needs_review: dto.needs_review ?? false,
+          review_note: dto.review_note?.trim() || null,
+          ai_meta: dto.ai_meta ?? null,
         }),
       );
     }
@@ -134,6 +150,14 @@ export class GlossaryService {
     if (dto.tags !== undefined) term.tags = this.mergeList(null, dto.tags);
     if (dto.description !== undefined) {
       term.description = dto.description?.trim() || null;
+    }
+    if (dto.status !== undefined) {
+      term.status = dto.status?.trim() || null;
+    }
+    if (dto.importance !== undefined) term.importance = dto.importance ?? null;
+    if (dto.needs_review !== undefined) term.needs_review = dto.needs_review;
+    if (dto.review_note !== undefined) {
+      term.review_note = dto.review_note?.trim() || null;
     }
 
     await this.termRepo.save(term);
@@ -236,6 +260,17 @@ export class GlossaryService {
       ...term,
       mention_count: counts.get(term.id) ?? 0,
     }));
+  }
+
+  /**
+   * Existing term with this name in this project, if any. Public so bulk import
+   * can tell "will create" from "will merge" before writing anything.
+   */
+  findByNameInProject(
+    projectId: number,
+    name: string,
+  ): Promise<GlossaryTerm | null> {
+    return this.findByName(projectId, name);
   }
 
   private findByName(

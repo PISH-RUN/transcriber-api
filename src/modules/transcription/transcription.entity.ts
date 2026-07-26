@@ -1,10 +1,4 @@
-import {
-  Column,
-  Entity,
-  JoinColumn,
-  ManyToOne,
-  OneToMany,
-} from 'typeorm';
+import { Column, Entity, JoinColumn, ManyToOne, OneToMany } from 'typeorm';
 import { BaseTimestampEntity } from '../../common/abstracts/base.entity';
 import { FileEntity } from '../file/file.entity';
 import { Project } from '../project/project.entity';
@@ -138,6 +132,15 @@ export class Transcription extends BaseTimestampEntity {
   // People the user expects to be present (drives voiceprint identification).
   @Column({ type: 'jsonb', nullable: true })
   expected_person_ids?: number[];
+
+  /**
+   * Speaker ids ("SPEAKER_00") belonging to the interviewer side — there may be
+   * several. Evidence extraction needs this: an interviewer's own summary of
+   * what the interviewee said must not be treated as a confirmed statement, and
+   * nothing else in the data distinguishes asking from answering.
+   */
+  @Column({ type: 'jsonb', nullable: true })
+  interviewer_speaker_ids?: string[] | null;
 
   // The single processed (merged + transcoded) MP3 we transcribe and play back.
   @Column({ nullable: true })

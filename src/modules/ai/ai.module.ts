@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { GeminiService } from './gemini.service';
+import { PromptService } from './prompt.service';
 import { TranscriptRefineService } from './transcript-refine.service';
 
 /**
@@ -9,7 +10,7 @@ import { TranscriptRefineService } from './transcript-refine.service';
  */
 @Module({
   imports: [ConfigModule],
-  providers: [GeminiService, TranscriptRefineService],
-  exports: [GeminiService, TranscriptRefineService],
+  providers: [GeminiService, PromptService, TranscriptRefineService],
+  exports: [GeminiService, PromptService, TranscriptRefineService],
 })
 export class AiModule {}

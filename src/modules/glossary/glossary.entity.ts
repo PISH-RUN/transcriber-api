@@ -44,6 +44,47 @@ export class GlossaryTerm extends BaseTimestampEntity {
   @Column({ type: 'text', nullable: true })
   description?: string | null;
 
+  /**
+   * How settled this entry is — "تأیید شده", "نیازمند تأیید", … Free text on
+   * purpose: it comes straight from the reviewer's own working notes, and
+   * constraining it would only get in the way. Filterable in the UI.
+   */
+  @Column({ type: 'varchar', length: 128, nullable: true })
+  status?: string | null;
+
+  // --- provenance and AI-extraction metadata -------------------------------
+
+  /** Where this entry came from: hand-tagged, bulk import, or an AI run. */
+  @Column({ type: 'varchar', length: 16, default: 'manual' })
+  origin: 'manual' | 'import' | 'ai';
+
+  /**
+   * How central the term is to the project (3–5 as scored by extraction, or set
+   * by hand). Kept as a real column because the panel sorts and filters on it.
+   */
+  @Column({ type: 'int', nullable: true })
+  importance?: number | null;
+
+  /** Extraction confidence, 0–1. Not a claim about the term being correct. */
+  @Column({ type: 'float', nullable: true })
+  confidence?: number | null;
+
+  /** Flagged by extraction as needing a human decision (spelling, identity…). */
+  @Column({ default: false })
+  needs_review: boolean;
+
+  /** Why it needs review, in the reviewer's own language. */
+  @Column({ type: 'text', nullable: true })
+  review_note?: string | null;
+
+  /**
+   * Anything an extraction run returned that has no column of its own. Kept so
+   * a later prompt change never silently discards information we already paid
+   * for; never read by business logic.
+   */
+  @Column({ type: 'jsonb', nullable: true })
+  ai_meta?: Record<string, unknown> | null;
+
   /** Not a column: filled in by the service for list views. */
   mention_count?: number;
 }

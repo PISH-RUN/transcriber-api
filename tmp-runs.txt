@@ -1,0 +1,2 @@
+{"id":11,"transcription_id":11,"kind":"evidence","status":"failed","created_at":"2026-07-26T08:50:26.666Z","msg":"خطا در استخراج: خطا در فراخوانی سرویس هوش مصنوعی: This request requires more credits, or f"}
+{"id":13,"transcription_id":11,"kind":"glossary","status":"failed","created_at":"2026-07-26T09:10:29.876Z","msg":"خطا در استخراج: اعتبار کلید سرویس هوش مصنوعی کافی نیست: حداکثر 7604 توکن خروجی ممکن است، ک"}

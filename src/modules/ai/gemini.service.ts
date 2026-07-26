@@ -10,6 +10,31 @@ const DEFAULT_MODEL = {
   google: 'gemini-2.5-flash',
 };
 
+const DEFAULT_MAX_OUTPUT_TOKENS = 8192;
+
+/** OpenRouter's wording when a request's `max_tokens` exceeds the key's credit. */
+const AFFORDABLE_TOKENS = /can only afford (\d+)/i;
+
+
+
+/**
+ * The provider refused the request because its `max_tokens` costs more than the
+ * key's remaining credit.
+ *
+ * Raised as its own type instead of being handled here, because the useful
+ * response is domain-specific: the caller knows what its output is made of and
+ * can ask for fewer, shorter items to fit the budget. This layer only knows how
+ * many tokens are affordable.
+ */
+export class LlmOutputBudgetError extends Error {
+  constructor(public readonly affordableTokens: number) {
+    super(
+      `اعتبار کلید سرویس هوش مصنوعی فقط ${affordableTokens} توکن خروجی را پوشش می‌دهد`,
+    );
+    this.name = 'LlmOutputBudgetError';
+  }
+}
+
 export interface CompletionRequest {
   system: string;
   user: string;
@@ -84,19 +109,34 @@ export class GeminiService {
       );
     }
 
-    const maxAttempts = 3;
+    const maxAttempts = 4;
     let lastError: any = null;
     let json = request.json === true;
+    const maxOutputTokens = request.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        const attemptRequest = { ...request, json };
+        const attemptRequest = { ...request, json, maxOutputTokens };
         return provider === 'openrouter'
           ? await this.callOpenRouter(attemptRequest)
           : await this.callGoogle(attemptRequest);
       } catch (error: any) {
         lastError = error;
         const status = error?.response?.status;
+        const detail = this.detailOf(error);
+
+        // OpenRouter prices a request by its `max_tokens` up front, so a high
+        // ceiling is refused outright once the key's remaining credit is lower —
+        // even when the answer would have been short. Matched on the message, not
+        // the status code: the provider answers this with 402, not 400.
+        const affordable = AFFORDABLE_TOKENS.exec(detail);
+        if (affordable) {
+          const budget = Number(affordable[1]);
+          this.logger.warn(
+            `LLM credit limit: requested ${maxOutputTokens} output tokens, only ${budget} affordable`,
+          );
+          throw new LlmOutputBudgetError(budget);
+        }
 
         // Some providers reject the JSON-mode hint. The parser tolerates prose
         // and code fences anyway, so drop the hint and try once more.
@@ -123,12 +163,19 @@ export class GeminiService {
       }
     }
 
-    const detail =
-      lastError?.response?.data?.error?.message ||
-      lastError?.response?.data?.message ||
-      lastError?.message ||
-      'unknown error';
-    throw new Error(`خطا در فراخوانی سرویس هوش مصنوعی: ${detail}`);
+    throw new Error(
+      `خطا در فراخوانی سرویس هوش مصنوعی: ${this.detailOf(lastError)}`,
+    );
+  }
+
+  /** The most specific message a provider gave us. */
+  private detailOf(error: any): string {
+    return (
+      error?.response?.data?.error?.message ||
+      error?.response?.data?.message ||
+      error?.message ||
+      'unknown error'
+    );
   }
 
   private async callOpenRouter(request: CompletionRequest): Promise<string> {

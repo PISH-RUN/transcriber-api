@@ -12,6 +12,7 @@ import { FileService } from '../file/file.service';
 import { PersonService } from '../person/person.service';
 import { ProjectService } from '../project/project.service';
 import { AnalysisService } from '../analysis/analysis.service';
+import { GlossaryScanService } from '../glossary/glossary-scan.service';
 import { TranscriptRefineService } from '../ai/transcript-refine.service';
 import { AudioProcessorService } from '../audio/audio-processor.service';
 import { SonioxClientService } from '../audio/soniox-client.service';
@@ -68,6 +69,7 @@ export class TranscriptionService {
     private readonly refiner: TranscriptRefineService,
     private readonly projectService: ProjectService,
     private readonly analysisService: AnalysisService,
+    private readonly glossaryScan: GlossaryScanService,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -225,7 +227,9 @@ export class TranscriptionService {
     // Attach the persons referenced by this transcription (expected + mapped)
     // so the frontend can resolve names without extra round-trips.
     const personIds = new Set<number>();
-    (transcription.expected_person_ids ?? []).forEach((pid) => personIds.add(pid));
+    (transcription.expected_person_ids ?? []).forEach((pid) =>
+      personIds.add(pid),
+    );
     Object.values(transcription.speaker_map ?? {}).forEach((pid) => {
       if (pid != null) personIds.add(pid);
     });
@@ -278,6 +282,7 @@ export class TranscriptionService {
       recorded_at?: string | null;
       tags?: string[] | null;
       project_id?: number | null;
+      interviewer_speaker_ids?: string[] | null;
       segments?: Transcription['segments'];
     },
   ): Promise<any> {
@@ -298,9 +303,21 @@ export class TranscriptionService {
     if (dto.tags !== undefined) {
       patch.tags = this.normalizeTags(dto.tags ?? undefined);
     }
+    if (dto.interviewer_speaker_ids !== undefined) {
+      const ids = [
+        ...new Set(
+          (dto.interviewer_speaker_ids ?? [])
+            .map((value) => String(value).trim())
+            .filter((value) => value.length > 0),
+        ),
+      ];
+      patch.interviewer_speaker_ids = ids.length ? ids : null;
+    }
     if (dto.project_id !== undefined) {
       patch.project_id =
-        dto.project_id == null ? null : (await this.projectService.findById(dto.project_id)).id;
+        dto.project_id == null
+          ? null
+          : (await this.projectService.findById(dto.project_id)).id;
     }
 
     if (dto.segments !== undefined) {
@@ -320,6 +337,11 @@ export class TranscriptionService {
     // in step when the recording is re-filed.
     if (dto.project_id !== undefined) {
       await this.analysisService.syncProject(id, patch.project_id ?? null);
+      // Filing a recording under a project is the first moment that project's
+      // glossary can apply to it.
+      this.autoScanGlossary(id, patch.project_id ?? null);
+    } else if (dto.segments !== undefined) {
+      this.autoScanGlossary(id, t.project_id ?? null);
     }
 
     return this.getDetail(id);
@@ -392,7 +414,10 @@ export class TranscriptionService {
 
     if (!t) throw new HttpException('رونویسی یافت نشد', 404);
     if (!t.stt_tokens?.length) {
-      throw new HttpException('توکن‌های گفتار برای این رونویسی ذخیره نشده است', 400);
+      throw new HttpException(
+        'توکن‌های گفتار برای این رونویسی ذخیره نشده است',
+        400,
+      );
     }
 
     const segments = this.merger.mergeTranscripts(
@@ -421,6 +446,10 @@ export class TranscriptionService {
     this.logger.log(
       `[Remerge] Transcription ${id}: ${t.stt_tokens.length} tokens -> ${segments.length} turns`,
     );
+
+    // Line boundaries moved, so previously recorded positions are stale; the
+    // scan re-establishes them for whatever is still findable.
+    this.autoScanGlossary(id, t.project_id ?? null);
 
     return this.getDetail(id);
   }
@@ -457,14 +486,18 @@ export class TranscriptionService {
     });
 
     this.runAiRefine(id).catch((error) => {
-      this.logger.error(`[Refine] Transcription ${id} failed: ${error?.message}`);
+      this.logger.error(
+        `[Refine] Transcription ${id} failed: ${error?.message}`,
+      );
     });
 
     return this.getStatus(id);
   }
 
   private async runAiRefine(id: number): Promise<void> {
-    this.logger.log(`[Refine] Starting transcription ${id} (${this.refiner.model})`);
+    this.logger.log(
+      `[Refine] Starting transcription ${id} (${this.refiner.model})`,
+    );
 
     try {
       const t = await this.transcriptionRepo.findOne({ where: { id } });
@@ -519,6 +552,10 @@ export class TranscriptionService {
       this.logger.log(
         `[Refine] Transcription ${id} done: ${changed} changed, ${rejected} rejected, ${failedBatches}/${totalBatches} batches failed`,
       );
+
+      // Proof-reading fixes exactly the kind of misspelling that stopped a term
+      // from being found, so the text is worth re-scanning now.
+      this.autoScanGlossary(id, current?.project_id ?? t.project_id ?? null);
     } catch (error: any) {
       await this.transcriptionRepo.update(id, {
         refine_status: 'failed',
@@ -607,7 +644,8 @@ export class TranscriptionService {
           user: null,
         },
       );
-      const duration = await this.audioProcessor.getAudioDuration(processedPath);
+      const duration =
+        await this.audioProcessor.getAudioDuration(processedPath);
       await this.transcriptionRepo.update(id, {
         processed_audio_id: processedFile.id,
         duration,
@@ -632,8 +670,7 @@ export class TranscriptionService {
         TranscriptionStatus.PROCESSING,
         'در حال تشخیص گویندگان...',
       );
-      const expectedPersonIds =
-        (await this.getExpectedPersonIds(id)) ?? [];
+      const expectedPersonIds = (await this.getExpectedPersonIds(id)) ?? [];
       const { diarization, suggestedMap, source } = await this.runDiarization(
         audioUrl,
         expectedPersonIds,
@@ -689,7 +726,9 @@ export class TranscriptionService {
       );
       this.logger.log(`[Process] Transcription ${id} ready for mapping`);
     } catch (error: any) {
-      this.logger.error(`[Process] Transcription ${id} failed: ${error?.message}`);
+      this.logger.error(
+        `[Process] Transcription ${id} failed: ${error?.message}`,
+      );
       await this.setStatus(
         id,
         TranscriptionStatus.FAILED,
@@ -746,9 +785,8 @@ export class TranscriptionService {
       return { diarization: [], suggestedMap: {}, source: 'soniox' };
     }
 
-    const voiceprints = await this.personService.getVoiceprintInputs(
-      expectedPersonIds,
-    );
+    const voiceprints =
+      await this.personService.getVoiceprintInputs(expectedPersonIds);
 
     if (voiceprints.length > 0) {
       try {
@@ -815,8 +853,14 @@ export class TranscriptionService {
         speakerSegments.set(seg.speaker, []);
         speakerOrder.push(seg.speaker);
       }
-      speakerSegments.get(seg.speaker)!.push({ start: seg.start, end: seg.end });
-      allSegments.push({ start: seg.start, end: seg.end, speaker: seg.speaker });
+      speakerSegments
+        .get(seg.speaker)!
+        .push({ start: seg.start, end: seg.end });
+      allSegments.push({
+        start: seg.start,
+        end: seg.end,
+        speaker: seg.speaker,
+      });
     }
     allSegments.sort((a, b) => a.start - b.start);
 
@@ -830,7 +874,10 @@ export class TranscriptionService {
       fallbackCounter++;
       const speakerNumber = numberMap.get(speakerId) ?? fallbackCounter;
       const segments = speakerSegments.get(speakerId)!;
-      const totalDuration = segments.reduce((sum, s) => sum + (s.end - s.start), 0);
+      const totalDuration = segments.reduce(
+        (sum, s) => sum + (s.end - s.start),
+        0,
+      );
 
       const { start, duration } = this.pickCleanWindow(
         segments,
@@ -953,7 +1000,9 @@ export class TranscriptionService {
    * When Pyannote is unavailable, synthesize diarization-like segments from
    * Soniox speaker numbers so speaker samples/labels still work.
    */
-  private deriveDiarizationFromTokens(tokens: SonioxToken[]): PyannoteSegment[] {
+  private deriveDiarizationFromTokens(
+    tokens: SonioxToken[],
+  ): PyannoteSegment[] {
     const segments: PyannoteSegment[] = [];
     let current: PyannoteSegment | null = null;
 
@@ -1043,7 +1092,39 @@ export class TranscriptionService {
       status_message: 'تکمیل شد',
     });
 
+    // The text is final and the speakers are settled, so this is the moment the
+    // project's existing glossary can be matched against it.
+    this.autoScanGlossary(id, transcription.project_id ?? null);
+
     return this.getDetail(id);
+  }
+
+  /**
+   * Link the project's existing glossary to this transcript, without being
+   * asked. A dictionary that has to be re-scanned by hand every time is a
+   * dictionary that quietly goes stale.
+   *
+   * Deliberately fire-and-forget: the caller is an HTTP request that must not
+   * wait on it, and a failed scan must never fail the action that triggered it.
+   * The scan is idempotent, so the manual button remains a safe retry.
+   */
+  private autoScanGlossary(id: number, projectId: number | null): void {
+    if (!projectId) return;
+
+    this.glossaryScan
+      .scan({ projectId, transcriptionId: id })
+      .then((result) => {
+        if (result.mentions_created > 0) {
+          this.logger.log(
+            `[Glossary] Auto-scan of transcription ${id}: ${result.mentions_created} mention(s) linked`,
+          );
+        }
+      })
+      .catch((error) => {
+        this.logger.warn(
+          `[Glossary] Auto-scan of transcription ${id} failed: ${error?.message}`,
+        );
+      });
   }
 
   private buildFinalText(
@@ -1055,10 +1136,7 @@ export class TranscriptionService {
     const lines: string[] = [];
     for (const seg of segments) {
       if (seg.speaker_id === 'SPEAKER_UNKNOWN') continue;
-      const cleanText = seg.text.replace(
-        /[\s.,!?؟،؛:;'"()[\]{}«»\-_…]+/g,
-        '',
-      );
+      const cleanText = seg.text.replace(/[\s.,!?؟،؛:;'"()[\]{}«»\-_…]+/g, '');
       if (cleanText.length === 0) continue;
 
       const personId = speakerMap[seg.speaker_id];

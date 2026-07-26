@@ -11,12 +11,20 @@ import {
 } from '@nestjs/common';
 import { ApiOperation, ApiQuery, ApiTags } from '@nestjs/swagger';
 import { EvidenceService } from './evidence.service';
-import { CreateEvidenceDto, UpdateEvidenceDto } from './evidence.dto';
+import { EvidenceImportService } from './evidence-import.service';
+import {
+  CreateEvidenceDto,
+  ImportEvidenceDto,
+  UpdateEvidenceDto,
+} from './evidence.dto';
 
 @ApiTags('Evidence')
 @Controller('evidence')
 export class EvidenceController {
-  constructor(private readonly evidenceService: EvidenceService) {}
+  constructor(
+    private readonly evidenceService: EvidenceService,
+    private readonly importService: EvidenceImportService,
+  ) {}
 
   @Get()
   @ApiOperation({
@@ -28,18 +36,36 @@ export class EvidenceController {
   @ApiQuery({ name: 'transcription_id', required: false })
   @ApiQuery({ name: 'type', required: false, description: 'comma-separated' })
   @ApiQuery({ name: 'search', required: false })
+  @ApiQuery({
+    name: 'term_id',
+    required: false,
+    description: 'فقط شواهدی که به این واژه دیکشنری وصل شده‌اند',
+  })
   list(
     @Query('project_id') projectId?: string,
     @Query('transcription_id') transcriptionId?: string,
     @Query('type') type?: string,
     @Query('search') search?: string,
+    @Query('term_id') termId?: string,
   ) {
     return this.evidenceService.list({
       projectId: this.toInt(projectId),
       transcriptionId: this.toInt(transcriptionId),
       types: this.parseTypes(type),
       search,
+      termId: this.toInt(termId),
     });
+  }
+
+  @Post('import')
+  @ApiOperation({
+    summary: 'بارگذاری گروهی سبد شواهد',
+    description:
+      'سند مارک‌داون شواهد را وارد می‌کند و هر نقل‌قول را روی خط واقعی رونویسی لنگر می‌اندازد. ' +
+      'شاهدی که پیدا نشود هم ثبت می‌شود ولی با `anchored: false`. با `dry_run: true` فقط پیش‌نمایش.',
+  })
+  importItems(@Body() dto: ImportEvidenceDto) {
+    return this.importService.import(dto);
   }
 
   @Get(':id')

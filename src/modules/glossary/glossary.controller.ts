@@ -12,16 +12,24 @@ import {
 } from '@nestjs/common';
 import { ApiOperation, ApiQuery, ApiTags } from '@nestjs/swagger';
 import { GlossaryService } from './glossary.service';
+import { GlossaryImportService } from './glossary-import.service';
+import { GlossaryScanService } from './glossary-scan.service';
 import {
   CreateGlossaryTermDto,
   GlossaryMentionInputDto,
+  ImportGlossaryDto,
+  ScanGlossaryDto,
   UpdateGlossaryTermDto,
 } from './glossary.dto';
 
 @ApiTags('Glossary')
 @Controller('glossary')
 export class GlossaryController {
-  constructor(private readonly glossaryService: GlossaryService) {}
+  constructor(
+    private readonly glossaryService: GlossaryService,
+    private readonly importService: GlossaryImportService,
+    private readonly scanService: GlossaryScanService,
+  ) {}
 
   @Get()
   @ApiOperation({
@@ -68,6 +76,32 @@ export class GlossaryController {
   @ApiOperation({ summary: 'Remove a single mention' })
   removeMention(@Param('id', ParseIntPipe) id: number) {
     return this.glossaryService.removeMention(id);
+  }
+
+  @Post('import')
+  @ApiOperation({
+    summary: 'بارگذاری گروهی واژه‌نامه',
+    description:
+      'جدول مارک‌داون (یا آرایه‌ی terms) را وارد می‌کند. واژه‌ی موجود merge می‌شود نه تکراری. ' +
+      'با `dry_run: true` فقط پیش‌نمایش می‌دهد و با `scan` بلافاصله ارجاع‌های واژه‌ها را در متن پیدا می‌کند.',
+  })
+  importTerms(@Body() dto: ImportGlossaryDto) {
+    return this.importService.import(dto);
+  }
+
+  @Post('scan')
+  @ApiOperation({
+    summary: 'یافتن ارجاع واژه‌های واژه‌نامه در متن رونویسی',
+    description:
+      'برای هر واژه در هر خط یک ارجاع ثبت می‌کند و روی اجرای دوباره چیزی تکرار نمی‌شود.',
+  })
+  scan(@Body() dto: ScanGlossaryDto) {
+    return this.scanService.scan({
+      projectId: dto.project_id,
+      transcriptionId: dto.transcription_id ?? null,
+      termIds: dto.term_ids,
+      dryRun: dto.dry_run,
+    });
   }
 
   @Get(':id')

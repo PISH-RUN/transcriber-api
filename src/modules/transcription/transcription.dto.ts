@@ -10,7 +10,10 @@ import { Type } from 'class-transformer';
 import { ApiProperty } from '@nestjs/swagger';
 
 export class SpeakerAssignmentDto {
-  @ApiProperty({ example: 'SPEAKER_00', description: 'شناسه گوینده تشخیص داده‌شده' })
+  @ApiProperty({
+    example: 'SPEAKER_00',
+    description: 'شناسه گوینده تشخیص داده‌شده',
+  })
   @IsString()
   speakerId: string;
 
@@ -101,6 +104,18 @@ export class UpdateTranscriptionDto {
   @IsOptional()
   @IsInt()
   project_id?: number | null;
+
+  @ApiProperty({
+    required: false,
+    type: [String],
+    example: ['SPEAKER_00'],
+    description:
+      'شناسه گویندگانی که سمت مصاحبه‌کننده هستند (می‌تواند چند نفر باشد). استخراج شواهد از این استفاده می‌کند تا جمع‌بندی خودِ مصاحبه‌گر را شاهد تأییدشده نشمارد.',
+  })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  interviewer_speaker_ids?: string[] | null;
 
   @ApiProperty({
     required: false,
