@@ -1,4 +1,0 @@
-run 16 (evidence) status=processing
-message: در حال تحلیل متن با هوش مصنوعی...
-warnings: null
-response_chars=null duration=-
