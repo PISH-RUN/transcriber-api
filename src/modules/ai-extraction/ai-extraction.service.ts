@@ -21,6 +21,7 @@ import { GlossaryScanService } from '../glossary/glossary-scan.service';
 import { EvidenceService } from '../evidence/evidence.service';
 import { ProjectCategoryKind } from '../project/project-category.entity';
 import { ProjectCategoryService } from '../project/project-category.service';
+import { PersonService } from '../person/person.service';
 import { GlossaryTerm } from '../glossary/glossary.entity';
 import { EvidenceItem } from '../evidence/evidence.entity';
 import { Project } from '../project/project.entity';
@@ -73,6 +74,7 @@ export class AiExtractionService {
     private readonly glossaryScan: GlossaryScanService,
     private readonly evidenceService: EvidenceService,
     private readonly categoryService: ProjectCategoryService,
+    private readonly personService: PersonService,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -174,6 +176,7 @@ export class AiExtractionService {
       const projectContext = project?.description ?? null;
 
       const rejectedLabels = await this.loadRejections(projectId, kind);
+      const speakerNames = await this.resolveSpeakerNames(transcription);
 
       if (kind === ExtractionKind.GLOSSARY) {
         const [categories, existingTerms] = await Promise.all([
@@ -187,6 +190,7 @@ export class AiExtractionService {
           existingTerms,
           projectContext,
           interviewerSpeakerIds: transcription.interviewer_speaker_ids,
+          speakerNames,
           rejectedLabels,
         });
 
@@ -220,6 +224,7 @@ export class AiExtractionService {
           existingEvidence,
           projectContext,
           interviewerSpeakerIds: transcription.interviewer_speaker_ids,
+          speakerNames,
           rejectedLabels,
         });
 
@@ -590,6 +595,35 @@ export class AiExtractionService {
     } catch {
       // Unique violation: already rejected once, which is the desired state.
     }
+  }
+
+  /**
+   * `speaker_id` -> the real name of the person mapped to it.
+   *
+   * The transcript's own `speaker_label` stays anonymous ("گوینده ۱") for the
+   * whole life of the recording — confirming speakers only rewrites
+   * `final_text`. Without this map the model is handed anonymous labels and
+   * writes them into every summary, so a finished evidence item says
+   * "گوینده 1 توضیح می‌دهد…" instead of naming the person.
+   */
+  private async resolveSpeakerNames(
+    transcription: Transcription,
+  ): Promise<Record<string, string>> {
+    const map = transcription.speaker_map ?? {};
+    const personIds = Object.values(map).filter(
+      (value): value is number => typeof value === 'number',
+    );
+    if (personIds.length === 0) return {};
+
+    const persons = await this.personService.findByIds(personIds);
+    const nameById = new Map(persons.map((person) => [person.id, person.name]));
+
+    const names: Record<string, string> = {};
+    Object.entries(map).forEach(([speakerId, personId]) => {
+      const name = personId != null ? nameById.get(personId) : undefined;
+      if (name) names[speakerId] = name;
+    });
+    return names;
   }
 
   private async loadRejections(

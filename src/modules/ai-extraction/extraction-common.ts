@@ -23,6 +23,29 @@ export interface TranscriptLine {
   text: string;
 }
 
+export interface TranscriptPayloadOptions {
+  interviewerSpeakerIds?: string[] | null;
+  /**
+   * `speaker_id` -> the person's real name, from the confirmed speaker mapping.
+   *
+   * Necessary because `segments[].speaker_label` keeps the anonymous
+   * "گوینده ۱" form for the whole life of the recording — only `final_text` ever
+   * gets the real names. Handing the anonymous form to the model means it writes
+   * "گوینده 1" into every summary it produces, which is useless in a report.
+   */
+  speakerNames?: Record<string, string>;
+}
+
+/** Display name of a segment's speaker: the mapped person, or the raw label. */
+export function speakerNameOf(
+  segment: Segments[number],
+  speakerNames?: Record<string, string>,
+): string {
+  return (
+    speakerNames?.[segment?.speaker_id ?? ''] || segment?.speaker_label || '؟'
+  );
+}
+
 /**
  * The transcript as the prompts expect it: ordered segments carrying their real
  * `segment_index`.
@@ -33,9 +56,9 @@ export interface TranscriptLine {
  */
 export function buildTranscriptPayload(
   segments: Segments,
-  interviewerSpeakerIds?: string[] | null,
+  options: TranscriptPayloadOptions = {},
 ): { lines: TranscriptLine[]; json: string } {
-  const interviewers = new Set(interviewerSpeakerIds ?? []);
+  const interviewers = new Set(options.interviewerSpeakerIds ?? []);
   const knowsRoles = interviewers.size > 0;
 
   const lines: TranscriptLine[] = [];
@@ -46,7 +69,7 @@ export function buildTranscriptPayload(
 
     lines.push({
       segment_index: index,
-      speaker: segment.speaker_label ?? '؟',
+      speaker: speakerNameOf(segment, options.speakerNames),
       ...(knowsRoles
         ? {
             role: interviewers.has(segment.speaker_id)

@@ -7,6 +7,7 @@ import { GlossaryExtractionService } from './glossary-extraction.service';
 import { EvidenceExtractionService } from './evidence-extraction.service';
 import { AiModule } from '../ai/ai.module';
 import { ProjectModule } from '../project/project.module';
+import { PersonModule } from '../person/person.module';
 import { GlossaryModule } from '../glossary/glossary.module';
 import { EvidenceModule } from '../evidence/evidence.module';
 import { Project } from '../project/project.entity';
@@ -32,6 +33,8 @@ import { Transcription } from '../transcription/transcription.entity';
     ]),
     AiModule,
     ProjectModule,
+    // Resolves speaker ids to the real person names the model should see.
+    PersonModule,
     GlossaryModule,
     EvidenceModule,
   ],

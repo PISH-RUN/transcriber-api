@@ -3,6 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { In, Repository } from 'typeorm';
 import { GlossaryMention, GlossaryTerm } from './glossary.entity';
 import { Transcription } from '../transcription/transcription.entity';
+import { PersonService } from '../person/person.service';
 import { buildFormMatcher } from '../../common/utils/persian-text';
 
 /** Characters of surrounding text kept with each mention, for readability. */
@@ -15,6 +16,8 @@ export interface ScanTarget {
   transcriptionId: number;
   title: string;
   segments: NonNullable<Transcription['segments']>;
+  /** `speaker_id` -> the confirmed person's name, when speakers are mapped. */
+  speakerNames: Record<string, string>;
 }
 
 export interface ScanTermHit {
@@ -56,6 +59,7 @@ export class GlossaryScanService {
     private readonly mentionRepo: Repository<GlossaryMention>,
     @InjectRepository(Transcription)
     private readonly transcriptionRepo: Repository<Transcription>,
+    private readonly personService: PersonService,
   ) {}
 
   /**
@@ -158,7 +162,13 @@ export class GlossaryScanService {
                     context: segment.text
                       .slice(from, from + CONTEXT_LENGTH)
                       .trim(),
-                    speaker_label: segment.speaker_label ?? null,
+                    // The mapped person's name where there is one: the raw label
+                    // stays anonymous for the life of the recording, and
+                    // "گوینده ۱" in a mention list tells the reviewer nothing.
+                    speaker_label:
+                      target.speakerNames[segment.speaker_id] ??
+                      segment.speaker_label ??
+                      null,
                     start_ms: segment.start_ms ?? null,
                   }),
                 );
@@ -209,19 +219,41 @@ export class GlossaryScanService {
   ): Promise<ScanTarget[]> {
     const query = this.transcriptionRepo
       .createQueryBuilder('t')
-      .select(['t.id', 't.title', 't.segments']);
+      .select(['t.id', 't.title', 't.segments', 't.speaker_map']);
 
     if (transcriptionId) query.where('t.id = :id', { id: transcriptionId });
     else query.where('t.project_id = :projectId', { projectId });
 
-    const rows = await query.getMany();
+    const rows = (await query.getMany()).filter(
+      (row) => Array.isArray(row.segments) && row.segments.length > 0,
+    );
 
-    return rows
-      .filter((row) => Array.isArray(row.segments) && row.segments.length > 0)
-      .map((row) => ({
+    // One person lookup for the whole scan, however many transcripts it covers.
+    const personIds = [
+      ...new Set(
+        rows.flatMap((row) =>
+          Object.values(row.speaker_map ?? {}).filter(
+            (value): value is number => typeof value === 'number',
+          ),
+        ),
+      ),
+    ];
+    const persons = await this.personService.findByIds(personIds);
+    const nameById = new Map(persons.map((person) => [person.id, person.name]));
+
+    return rows.map((row) => {
+      const speakerNames: Record<string, string> = {};
+      Object.entries(row.speaker_map ?? {}).forEach(([speakerId, personId]) => {
+        const name = personId != null ? nameById.get(personId) : undefined;
+        if (name) speakerNames[speakerId] = name;
+      });
+
+      return {
         transcriptionId: row.id,
         title: row.title,
         segments: row.segments as NonNullable<Transcription['segments']>,
-      }));
+        speakerNames,
+      };
+    });
   }
 }

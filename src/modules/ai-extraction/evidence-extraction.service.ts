@@ -22,6 +22,7 @@ import {
   fingerprintOf,
   itemsWithinBudget,
   parseJsonObject,
+  speakerNameOf,
   timeToMs,
 } from './extraction-common';
 
@@ -162,6 +163,8 @@ export interface EvidenceExtractionInput {
   existingEvidence: EvidenceItem[];
   projectContext?: string | null;
   interviewerSpeakerIds?: string[] | null;
+  /** `speaker_id` -> the confirmed person's real name. */
+  speakerNames?: Record<string, string>;
   rejectedLabels: string[];
 }
 
@@ -191,10 +194,10 @@ export class EvidenceExtractionService {
   async extract(
     input: EvidenceExtractionInput,
   ): Promise<EvidenceExtractionOutput> {
-    const { json: transcriptJson } = buildTranscriptPayload(
-      input.segments,
-      input.interviewerSpeakerIds,
-    );
+    const { json: transcriptJson } = buildTranscriptPayload(input.segments, {
+      interviewerSpeakerIds: input.interviewerSpeakerIds,
+      speakerNames: input.speakerNames,
+    });
 
     const user = this.buildUserMessage(input, transcriptJson);
     const notes: string[] = [];
@@ -348,7 +351,8 @@ export class EvidenceExtractionService {
 
     const index = buildAnchorIndex(input.segments);
     const segments = input.segments;
-    const labelStripper = this.buildLabelStripper(segments);
+    const speakerNames = input.speakerNames;
+    const labelStripper = this.buildLabelStripper(segments, speakerNames);
 
     const existingFingerprints = new Set(
       input.existingEvidence.map((item) => this.quoteFingerprint(item.quote)),
@@ -394,7 +398,7 @@ export class EvidenceExtractionService {
       const claimed = Number(item?.source?.start_segment_index);
       const claimedIndex = Number.isInteger(claimed) ? claimed : null;
 
-      const located = this.locate(quote, index, segments);
+      const located = this.locate(quote, index, segments, speakerNames);
       if (!located.anchored) {
         problems.push(
           'نقل‌قول در متن رونویسی پیدا نشد؛ ممکن است مدل آن را بازنویسی کرده باشد',
@@ -517,12 +521,18 @@ export class EvidenceExtractionService {
    * Built from the transcript's own labels rather than a generic "word before a
    * colon" pattern, so a real colon inside speech is never mistaken for one.
    */
-  private buildLabelStripper(segments: Segments): RegExp | null {
+  private buildLabelStripper(
+    segments: Segments,
+    speakerNames?: Record<string, string>,
+  ): RegExp | null {
     const labels = [
       ...new Set(
-        segments
-          .map((segment) => (segment?.speaker_label ?? '').trim())
-          .filter((label) => label.length > 1),
+        [
+          // Both forms: the anonymous label the data carries, and the person name
+          // the model was actually given.
+          ...segments.map((segment) => (segment?.speaker_label ?? '').trim()),
+          ...Object.values(speakerNames ?? {}).map((name) => name.trim()),
+        ].filter((label) => label.length > 1),
       ),
     ].sort((a, b) => b.length - a.length);
 
@@ -556,6 +566,7 @@ export class EvidenceExtractionService {
     quote: string,
     index: ReturnType<typeof buildAnchorIndex>,
     segments: Segments,
+    speakerNames?: Record<string, string>,
   ): {
     quote: string;
     anchored: boolean;
@@ -597,7 +608,11 @@ export class EvidenceExtractionService {
       endSegmentIndex: endSegment > hit.segmentIndex ? endSegment : null,
       startMs: segments[hit.segmentIndex]?.start_ms ?? null,
       endMs: segments[endSegment]?.end_ms ?? null,
-      speakerLabel: segments[hit.segmentIndex]?.speaker_label ?? null,
+      // The person's name, not the anonymous label, so the stored item reads the
+      // way a report needs it.
+      speakerLabel: segments[hit.segmentIndex]
+        ? speakerNameOf(segments[hit.segmentIndex], speakerNames)
+        : null,
     };
   }
 

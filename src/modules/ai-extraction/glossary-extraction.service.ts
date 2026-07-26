@@ -96,6 +96,8 @@ export interface GlossaryExtractionInput {
   existingTerms: GlossaryTerm[];
   projectContext?: string | null;
   interviewerSpeakerIds?: string[] | null;
+  /** `speaker_id` -> the confirmed person's real name. */
+  speakerNames?: Record<string, string>;
   /** Candidates the reviewer already turned down, by label. */
   rejectedLabels: string[];
 }
@@ -129,7 +131,10 @@ export class GlossaryExtractionService {
   ): Promise<GlossaryExtractionOutput> {
     const { json: transcriptJson, lines } = buildTranscriptPayload(
       input.segments,
-      input.interviewerSpeakerIds,
+      {
+        interviewerSpeakerIds: input.interviewerSpeakerIds,
+        speakerNames: input.speakerNames,
+      },
     );
 
     const user = this.buildUserMessage(input, transcriptJson);
