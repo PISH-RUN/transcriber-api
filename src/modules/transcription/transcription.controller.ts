@@ -168,6 +168,16 @@ export class TranscriptionController {
     return this.transcriptionService.update(id, dto);
   }
 
+  @Post(':id/retry')
+  @ApiOperation({
+    summary: 'Run the processing pipeline again for a failed recording',
+    description:
+      'Re-downloads the original uploads from storage and re-enters the pipeline from the start. Allowed for failed recordings, and for runs that have been silent long enough to be presumed dead. Returns immediately — poll GET /transcriptions/:id/status.',
+  })
+  retry(@Param('id', ParseIntPipe) id: number) {
+    return this.transcriptionService.retryProcessing(id);
+  }
+
   @Post(':id/remerge')
   @ApiOperation({
     summary: 'Rebuild the transcript from the stored STT tokens + diarization',

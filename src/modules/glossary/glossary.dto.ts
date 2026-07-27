@@ -311,6 +311,50 @@ export class ImportGlossaryDto {
   dry_run?: boolean;
 }
 
+/** Fold one entry into another: "علی" and "علی اسماعیلی" are one person. */
+export class MergeGlossaryTermsDto {
+  @ApiProperty({
+    description: 'واژه‌ای که حذف می‌شود؛ نام و شکل‌هایش به واژه مقصد می‌رود',
+  })
+  @IsInt()
+  source_id: number;
+
+  @ApiProperty({ description: 'واژه‌ای که باقی می‌ماند' })
+  @IsInt()
+  target_id: number;
+}
+
+/** Take one wording back off a term — the undo for a wrong match. */
+export class DetachAliasDto {
+  @ApiProperty({
+    description: 'شکلی که باید از واژه جدا شود (یکی از «شکل‌های دیگر»)',
+    example: 'علی',
+  })
+  @IsNotEmpty()
+  @IsString()
+  @MaxLength(255)
+  form: string;
+
+  @ApiProperty({
+    required: false,
+    enum: ['remove', 'promote'],
+    description:
+      'remove: شکل و ارجاع‌هایش حذف می‌شوند. promote: شکل به یک واژه مستقل تبدیل می‌شود و ارجاع‌هایش به آن منتقل می‌شود',
+  })
+  @IsOptional()
+  @IsIn(['remove', 'promote'])
+  mode?: 'remove' | 'promote';
+
+  @ApiProperty({
+    required: false,
+    description: 'دسته‌بندی واژه تازه در حالت promote؛ پیش‌فرض دسته واژه فعلی',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  category?: string;
+}
+
 export class ScanGlossaryDto {
   @ApiProperty({ description: 'پروژه‌ای که واژه‌نامه‌اش اسکن می‌شود' })
   @IsInt()

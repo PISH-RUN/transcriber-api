@@ -37,6 +37,8 @@ export interface ApplyResult {
   rejected: number;
   /** Glossary runs: mentions recorded for the newly accepted terms. */
   mentions_created?: number;
+  /** Glossary runs: accepted as another wording of an existing entry. */
+  attached?: number;
   /** Ids of what was created, so the UI can jump straight to it. */
   created_ids: number[];
   problems: Array<{ candidate_id: number; reason: string }>;
@@ -372,7 +374,12 @@ export class AiExtractionService {
         candidate.created_id = id;
         result.accepted += 1;
         result.created_ids.push(id);
-        if (run.kind === ExtractionKind.GLOSSARY) acceptedTermIds.push(id);
+        if (run.kind === ExtractionKind.GLOSSARY) {
+          acceptedTermIds.push(id);
+          if (merged.attach_to_term_id != null) {
+            result.attached = (result.attached ?? 0) + 1;
+          }
+        }
       } catch (error: unknown) {
         result.problems.push({
           candidate_id: decision.candidate_id,
@@ -439,6 +446,8 @@ export class AiExtractionService {
             'status',
             'importance',
             'review_note',
+            // "this is the same thing as term #12, just spelled differently"
+            'attach_to_term_id',
           ]
         : [
             'title',
@@ -475,6 +484,32 @@ export class AiExtractionService {
     run: AiExtractionRun,
     candidate: StoredCandidate,
   ): Promise<number> {
+    // The reviewer said this proposal is another wording of an entry the project
+    // already has. Creating a second row would be the wrong answer: "علی", "علی
+    // آقا" and "علی اسماعیلی" are one person, and only one entry can accumulate
+    // that person's mentions and evidence.
+    if (candidate.attach_to_term_id != null) {
+      const target = await this.glossaryService.findTerm(
+        Number(candidate.attach_to_term_id),
+      );
+      if (target.project_id !== run.project_id) {
+        throw new Error('واژه مقصد از پروژه دیگری است');
+      }
+
+      const merged = await this.glossaryService.attachAliases(target.id, {
+        aliases: [
+          String(candidate.term ?? '').trim(),
+          ...(Array.isArray(candidate.aliases) ? candidate.aliases : []),
+        ],
+        tags: Array.isArray(candidate.tags) ? candidate.tags : null,
+        description: candidate.definition || null,
+        status: candidate.status || null,
+        importance: candidate.importance ?? null,
+        ai_meta: this.termMeta(run, candidate),
+      });
+      return merged.id;
+    }
+
     const term = await this.glossaryService.createTerm({
       project_id: run.project_id,
       term: String(candidate.term ?? '').trim(),

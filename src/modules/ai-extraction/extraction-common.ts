@@ -377,6 +377,11 @@ export interface StoredCandidate {
   status_key?: 'confirmed' | 'tentative' | 'disputed';
   occurrence_count?: number;
   examples?: unknown;
+  /**
+   * Set by the reviewer: this proposal is another wording of that existing term,
+   * so accepting it must extend that entry instead of creating a new one.
+   */
+  attach_to_term_id?: number | null;
 
   // evidence
   title?: string;

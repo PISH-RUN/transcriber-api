@@ -114,6 +114,18 @@ export function normalizeForCompare(value: string): string {
   return result.trim();
 }
 
+/**
+ * Key for resolving a *match* back to the wording it belongs to.
+ *
+ * Whitespace is dropped on top of the usual normalization because the compiled
+ * pattern treats a space in the term as optional: it happily finds
+ * «روغن‌پایه» for «روغن پایه». Without this, that hit could not be resolved
+ * back to its term and the scan discarded it — the tolerance in the pattern was
+ * being undone one step later.
+ */
+const matchKey = (value: string): string =>
+  normalizeForCompare(value).replace(/\s+/g, '');
+
 /** Anything that is not a letter or a digit, in any quantity. */
 const SEPARATOR_CLASS = '[^\\p{L}\\p{N}]*';
 
@@ -204,7 +216,7 @@ export function buildFormMatcher<T>(
   entries.forEach(({ form, value }) => {
     const canonical = normalizeForCompare(form);
     if (canonical.length < 2) return; // single characters match everywhere
-    if (!byCanonical.has(canonical)) byCanonical.set(canonical, value);
+    if (!byCanonical.has(matchKey(form))) byCanonical.set(matchKey(form), value);
 
     const pattern = persianPatternFor(form);
     if (pattern) patterns.push({ pattern, length: canonical.length });
@@ -224,7 +236,7 @@ export function buildFormMatcher<T>(
       boundaries ? withBoundaries(source) : `(?:${source})`,
       'gu',
     ),
-    resolve: (matched: string) => byCanonical.get(normalizeForCompare(matched)),
+    resolve: (matched: string) => byCanonical.get(matchKey(matched)),
   };
 }
 

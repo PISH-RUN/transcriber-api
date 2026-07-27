@@ -16,8 +16,10 @@ import { GlossaryImportService } from './glossary-import.service';
 import { GlossaryScanService } from './glossary-scan.service';
 import {
   CreateGlossaryTermDto,
+  DetachAliasDto,
   GlossaryMentionInputDto,
   ImportGlossaryDto,
+  MergeGlossaryTermsDto,
   ScanGlossaryDto,
   UpdateGlossaryTermDto,
 } from './glossary.dto';
@@ -89,6 +91,17 @@ export class GlossaryController {
     return this.importService.import(dto);
   }
 
+  @Post('merge')
+  @ApiOperation({
+    summary: 'ادغام دو واژه در یکی',
+    description:
+      'نام و شکل‌های دیگر واژه مبدأ به واژه مقصد اضافه می‌شود، ارجاع‌ها و شواهد مرتبط منتقل می‌شوند (تکراری‌ها حذف) و واژه مبدأ پاک می‌شود. ' +
+      'برای وقتی که یک مفهوم به‌اشتباه دو ردیف شده است («علی» و «علی اسماعیلی»).',
+  })
+  mergeTerms(@Body() dto: MergeGlossaryTermsDto) {
+    return this.glossaryService.mergeTerms(dto.source_id, dto.target_id);
+  }
+
   @Post('scan')
   @ApiOperation({
     summary: 'یافتن ارجاع واژه‌های واژه‌نامه در متن رونویسی',
@@ -135,6 +148,21 @@ export class GlossaryController {
     @Body() dto: GlossaryMentionInputDto,
   ) {
     return this.glossaryService.addMention(id, dto);
+  }
+
+  @Post(':id/detach')
+  @ApiOperation({
+    summary: 'جدا کردن یک شکل از واژه',
+    description:
+      'شکلی که به‌اشتباه به این واژه وصل شده (مثلاً «علی» که داخل «فعلی» هم پیدا می‌شد) را برمی‌دارد. ' +
+      'با `mode: "promote"` همان شکل به یک واژه مستقل تبدیل می‌شود و ارجاع‌هایش منتقل می‌شوند؛ ' +
+      'پیش‌فرض `remove` است که شکل و ارجاع‌های ناشی از آن را حذف می‌کند.',
+  })
+  detachAlias(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() dto: DetachAliasDto,
+  ) {
+    return this.glossaryService.detachAlias(id, dto);
   }
 
   @Patch(':id')

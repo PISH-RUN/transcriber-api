@@ -1,4 +1,4 @@
-import { HttpException, Injectable } from '@nestjs/common';
+import { HttpException, Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { GlossaryMention, GlossaryTerm } from './glossary.entity';
@@ -7,6 +7,7 @@ import {
   GlossaryMentionInputDto,
   UpdateGlossaryTermDto,
 } from './glossary.dto';
+import { EvidenceTermLink } from '../evidence/evidence.entity';
 import { ProjectCategoryKind } from '../project/project-category.entity';
 import { ProjectCategoryService } from '../project/project-category.service';
 
@@ -18,13 +19,55 @@ export interface ListTermsFilter {
   category?: string;
 }
 
+/** What a merge actually did, so the UI can report it instead of guessing. */
+export interface MergeTermsResult {
+  term: GlossaryTerm;
+  /** Name of the entry that no longer exists. */
+  merged_term: string;
+  mentions_moved: number;
+  /** Mentions discarded because the survivor already covered that line. */
+  mentions_dropped: number;
+  evidence_links_moved: number;
+  aliases_added: number;
+}
+
+/** What detaching a wording did. */
+export interface DetachAliasResult {
+  term: GlossaryTerm;
+  detached_form: string;
+  mode: 'remove' | 'promote';
+  mentions_moved: number;
+  mentions_removed: number;
+  /** The new entry, when the wording was promoted rather than dropped. */
+  created_term: GlossaryTerm | null;
+}
+
+/** Case-insensitive, whitespace-insensitive identity of a wording. */
+function normalizeName(value: string): string {
+  return String(value ?? '')
+    .trim()
+    .toLowerCase();
+}
+
+/** One mention per transcript line — the identity a merge must not duplicate. */
+function mentionKey(mention: {
+  transcription_id: number;
+  segment_index?: number | null;
+}): string {
+  return `${mention.transcription_id}:${mention.segment_index ?? 'null'}`;
+}
+
 @Injectable()
 export class GlossaryService {
+  private readonly logger = new Logger(GlossaryService.name);
+
   constructor(
     @InjectRepository(GlossaryTerm)
     private readonly termRepo: Repository<GlossaryTerm>,
     @InjectRepository(GlossaryMention)
     private readonly mentionRepo: Repository<GlossaryMention>,
+    @InjectRepository(EvidenceTermLink)
+    private readonly evidenceLinkRepo: Repository<EvidenceTermLink>,
     private readonly categoryService: ProjectCategoryService,
   ) {}
 
@@ -169,6 +212,305 @@ export class GlossaryService {
     if (!term) throw new HttpException(TERM_NOT_FOUND, 404);
     await this.termRepo.remove(term);
     return { success: true };
+  }
+
+  /**
+   * Record more wordings of a term that is already in the glossary.
+   *
+   * The case this exists for: the same person is called "علی" in one recording,
+   * "علی آقا" in the next and "علی اسماعیلی" in a third. Those are one entry with
+   * three surface forms, not three entries — and because the scan matches on
+   * `term` plus every alias, adding the form here is what makes the older
+   * recordings light up too.
+   *
+   * Everything else on the payload is merged the way `createTerm` merges into an
+   * existing entry: fill the empty fields, keep the higher importance, never
+   * overwrite what a human already wrote.
+   */
+  async attachAliases(
+    targetId: number,
+    input: {
+      aliases: string[];
+      tags?: string[] | null;
+      description?: string | null;
+      status?: string | null;
+      importance?: number | null;
+      ai_meta?: Record<string, unknown> | null;
+    },
+  ): Promise<GlossaryTerm> {
+    const term = await this.termRepo.findOne({ where: { id: targetId } });
+    if (!term) throw new HttpException(TERM_NOT_FOUND, 404);
+
+    // The canonical spelling is not one of its own alternatives.
+    const canonical = normalizeName(term.term);
+    const incoming = (input.aliases ?? []).filter(
+      (alias) => normalizeName(alias) !== canonical,
+    );
+
+    term.aliases = this.mergeList(term.aliases, incoming);
+    term.tags = this.mergeList(term.tags, input.tags);
+
+    if (input.description?.trim() && !term.description) {
+      term.description = input.description.trim();
+    }
+    if (input.status?.trim() && !term.status) {
+      term.status = input.status.trim();
+    }
+    if (input.importance != null) {
+      term.importance = Math.max(term.importance ?? 0, input.importance);
+    }
+    if (input.ai_meta) {
+      term.ai_meta = { ...(term.ai_meta ?? {}), ...input.ai_meta };
+    }
+
+    await this.termRepo.save(term);
+    return this.findTerm(targetId);
+  }
+
+  /**
+   * Take one wording back off a term.
+   *
+   * The undo for the two ways wordings get joined (the wizard's "same entry,
+   * different spelling" and a merge), plus the honest answer to a wrong alias:
+   * an alias is not cosmetic, it is what the scan and the highlighter match on,
+   * so a wrong one keeps producing wrong references until it is removed.
+   *
+   * `mode: 'promote'` is for the case where the wording was not wrong, just not
+   * the same thing: it becomes an entry of its own and takes its references with
+   * it. `mode: 'remove'` simply drops it, along with the references that only
+   * exist because of it.
+   */
+  async detachAlias(
+    termId: number,
+    input: { form: string; mode?: 'remove' | 'promote'; category?: string },
+  ): Promise<DetachAliasResult> {
+    const term = await this.termRepo.findOne({ where: { id: termId } });
+    if (!term) throw new HttpException(TERM_NOT_FOUND, 404);
+
+    const form = String(input.form ?? '').trim();
+    const canonical = normalizeName(form);
+    if (!canonical) throw new HttpException('شکل واژه خالی است', 400);
+
+    if (canonical === normalizeName(term.term)) {
+      throw new HttpException(
+        'این شکل رسمی خودِ واژه است و جدا نمی‌شود؛ برای تغییرش واژه را ویرایش کنید',
+        400,
+      );
+    }
+
+    const remaining = (term.aliases ?? []).filter(
+      (alias) => normalizeName(alias) !== canonical,
+    );
+    if (remaining.length === (term.aliases?.length ?? 0)) {
+      throw new HttpException('این شکل در فهرست شکل‌های این واژه نیست', 404);
+    }
+
+    // References that exist only because of this wording. Matched on the stored
+    // `surface`, which is what was actually found in the text — comparing
+    // against the term instead would take down the correct references too.
+    const mentions = (
+      await this.mentionRepo.find({ where: { term_id: termId } })
+    ).filter((mention) => normalizeName(mention.surface ?? '') === canonical);
+
+    let promoted: GlossaryTerm | null = null;
+
+    if (input.mode === 'promote') {
+      const category = input.category?.trim() || term.category;
+      await this.categoryService.assertValid(
+        term.project_id,
+        ProjectCategoryKind.GLOSSARY,
+        category,
+      );
+
+      const clash = await this.findByName(term.project_id, form);
+      if (clash) {
+        throw new HttpException(
+          `واژه‌ای با نام «${form}» از قبل در این پروژه هست`,
+          409,
+        );
+      }
+
+      promoted = await this.termRepo.save(
+        this.termRepo.create({
+          project_id: term.project_id,
+          term: form,
+          category,
+          origin: term.origin,
+          ai_meta: { detached_from: { id: term.id, term: term.term } },
+        }),
+      );
+
+      // The references move with it: they were real occurrences of this wording,
+      // only filed under the wrong entry.
+      mentions.forEach((mention) => {
+        mention.term_id = promoted!.id;
+      });
+      if (mentions.length > 0) {
+        await this.mentionRepo.save(mentions, { chunk: 200 });
+      }
+    } else if (mentions.length > 0) {
+      await this.mentionRepo.remove(mentions, { chunk: 200 });
+    }
+
+    term.aliases = remaining.length ? remaining : null;
+    await this.termRepo.save(term);
+
+    this.logger.log(
+      `[Glossary] Detached "${form}" from term ${termId} (${input.mode ?? 'remove'}): ` +
+        `${mentions.length} mention(s) ${input.mode === 'promote' ? 'moved' : 'removed'}`,
+    );
+
+    return {
+      term: await this.findTerm(termId),
+      detached_form: form,
+      mode: input.mode === 'promote' ? 'promote' : 'remove',
+      mentions_moved: input.mode === 'promote' ? mentions.length : 0,
+      mentions_removed: input.mode === 'promote' ? 0 : mentions.length,
+      created_term: promoted ? await this.findTerm(promoted.id) : null,
+    };
+  }
+
+  /**
+   * Fold one term into another and delete it.
+   *
+   * Needed because the split usually only becomes visible later: "علی" and "علی
+   * اسماعیلی" are entered from different recordings, weeks apart, and nobody
+   * notices they are one person until both have mentions and evidence hanging
+   * off them. Deleting one of them would throw that history away, so the two
+   * histories are joined instead.
+   *
+   * The loser's name and alternatives become alternatives of the survivor, which
+   * is what keeps highlighting and the scan working on the old wordings.
+   */
+  async mergeTerms(
+    sourceId: number,
+    targetId: number,
+  ): Promise<MergeTermsResult> {
+    if (sourceId === targetId) {
+      throw new HttpException('نمی‌توان یک واژه را با خودش ادغام کرد', 400);
+    }
+
+    const source = await this.termRepo.findOne({ where: { id: sourceId } });
+    if (!source) throw new HttpException(TERM_NOT_FOUND, 404);
+    const target = await this.termRepo.findOne({ where: { id: targetId } });
+    if (!target) throw new HttpException(TERM_NOT_FOUND, 404);
+
+    // Nothing in the schema stops a cross-project merge, and it would quietly
+    // move one project's references into another's dictionary.
+    if (source.project_id !== target.project_id) {
+      throw new HttpException(
+        'دو واژه از یک پروژه نیستند و ادغام‌شان ممکن نیست',
+        400,
+      );
+    }
+
+    // --- mentions: keep one per (transcript, line) ---------------------------
+    // `glossary_mentions` has no unique index on that pair — the one-per-line
+    // rule lives in the scan's code — so a blind repoint would leave the merged
+    // term with the same line listed twice.
+    const targetKeys = new Set(
+      (
+        await this.mentionRepo.find({
+          where: { term_id: targetId },
+          select: { transcription_id: true, segment_index: true },
+        })
+      ).map((mention) => mentionKey(mention)),
+    );
+
+    const sourceMentions = await this.mentionRepo.find({
+      where: { term_id: sourceId },
+    });
+
+    const moving: GlossaryMention[] = [];
+    const dropping: GlossaryMention[] = [];
+    sourceMentions.forEach((mention) => {
+      const key = mentionKey(mention);
+      if (targetKeys.has(key)) {
+        dropping.push(mention);
+      } else {
+        targetKeys.add(key);
+        mention.term_id = targetId;
+        moving.push(mention);
+      }
+    });
+
+    if (moving.length > 0) {
+      await this.mentionRepo.save(moving, { chunk: 200 });
+    }
+    if (dropping.length > 0) {
+      await this.mentionRepo.remove(dropping, { chunk: 200 });
+    }
+
+    // --- evidence links: unique per (evidence, term) -------------------------
+    const evidenceMoved = await this.moveEvidenceLinks(sourceId, targetId);
+
+    // --- the entry itself ---------------------------------------------------
+    const before = target.aliases?.length ?? 0;
+    const merged = await this.attachAliases(targetId, {
+      aliases: [source.term, ...(source.aliases ?? [])],
+      tags: source.tags,
+      description: source.description,
+      status: source.status,
+      importance: source.importance,
+      ai_meta: source.ai_meta
+        ? { merged_from: { id: source.id, term: source.term } }
+        : null,
+    });
+
+    await this.termRepo.remove(source);
+
+    this.logger.log(
+      `[Glossary] Merged term ${sourceId} ("${source.term}") into ${targetId} ("${target.term}"): ` +
+        `${moving.length} mention(s) moved, ${dropping.length} duplicate(s) dropped, ` +
+        `${evidenceMoved} evidence link(s) moved`,
+    );
+
+    return {
+      term: merged,
+      merged_term: source.term,
+      mentions_moved: moving.length,
+      mentions_dropped: dropping.length,
+      evidence_links_moved: evidenceMoved,
+      aliases_added: (merged.aliases?.length ?? 0) - before,
+    };
+  }
+
+  /**
+   * Repoint the loser's evidence links, dropping the ones the survivor already
+   * has (`uq_evidence_term` would reject them).
+   */
+  private async moveEvidenceLinks(
+    sourceId: number,
+    targetId: number,
+  ): Promise<number> {
+    const links = await this.evidenceLinkRepo.find({
+      where: [{ term_id: sourceId }, { term_id: targetId }],
+    });
+
+    const targetEvidence = new Set(
+      links
+        .filter((link) => link.term_id === targetId)
+        .map((link) => link.evidence_id),
+    );
+
+    const moving: EvidenceTermLink[] = [];
+    const dropping: EvidenceTermLink[] = [];
+    links
+      .filter((link) => link.term_id === sourceId)
+      .forEach((link) => {
+        if (targetEvidence.has(link.evidence_id)) {
+          dropping.push(link);
+        } else {
+          targetEvidence.add(link.evidence_id);
+          link.term_id = targetId;
+          moving.push(link);
+        }
+      });
+
+    if (moving.length > 0) await this.evidenceLinkRepo.save(moving);
+    if (dropping.length > 0) await this.evidenceLinkRepo.remove(dropping);
+
+    return moving.length;
   }
 
   // ---------------------------------------------------------------------------

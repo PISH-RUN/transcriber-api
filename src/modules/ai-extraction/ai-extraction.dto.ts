@@ -40,7 +40,8 @@ export class CandidateDecisionDto {
   @ApiProperty({
     required: false,
     description:
-      'اصلاحات بازبین پیش از ثبت. برای واژه: term, category, definition, aliases, tags, status, importance. ' +
+      'اصلاحات بازبین پیش از ثبت. برای واژه: term, category, definition, aliases, tags, status, importance, ' +
+      'و attach_to_term_id (اگر داده شود، واژه تازه ساخته نمی‌شود و این پیشنهاد به‌عنوان شکل دیگرِ همان واژه ثبت می‌شود). ' +
       'برای شاهد: title, type, quote, note, claim_summary, tags, term_ids, verification, importance, sensitivity, segment_index.',
   })
   @IsOptional()

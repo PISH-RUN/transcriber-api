@@ -2,6 +2,7 @@ import { HttpException, Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import * as fs from 'fs';
+import * as path from 'path';
 import {
   SpeakerSample,
   Transcription,
@@ -23,6 +24,17 @@ import {
 } from '../audio/transcript-merger.service';
 
 const PLAYBACK_URL_TTL = 6 * 60 * 60; // 6h
+
+/**
+ * How long a run may go without touching the row before it is presumed dead.
+ *
+ * The pipeline is fire-and-forget in memory, so an API restart mid-run leaves
+ * the row `processing` for ever with nothing left to finish it. Every step
+ * writes a status message, and the longest single step (Pyannote polling) has
+ * its own timeout well under this, so silence this long means the process is
+ * gone and a retry is safe rather than a second concurrent run.
+ */
+const STALE_RUN_MS = 2 * 60 * 60 * 1000; // 2h
 const TARGET_SAMPLE_DURATION = 30; // seconds
 const ALLOWED_OVERLAP_SECONDS = 1.0;
 
@@ -105,21 +117,41 @@ export class TranscriptionService {
 
     // Persist each uploaded file to S3 and record it (order preserved).
     const localPaths: string[] = [];
-    for (let i = 0; i < input.files.length; i++) {
-      const f = input.files[i];
-      localPaths.push(f.path);
-      const stored = await this.fileService.uploadFileFromPath(f.path, {
-        file_type: 'audio',
-        name: f.originalname,
-        user: null,
-      });
-      await this.audioRepo.save(
-        this.audioRepo.create({
-          transcription_id: transcription.id,
-          audio_id: stored.id,
-          order: i + 1,
-          original_name: f.originalname,
-        }),
+    try {
+      for (let i = 0; i < input.files.length; i++) {
+        const f = input.files[i];
+        localPaths.push(f.path);
+        const stored = await this.fileService.uploadFileFromPath(f.path, {
+          file_type: 'audio',
+          name: f.originalname,
+          user: null,
+        });
+        await this.audioRepo.save(
+          this.audioRepo.create({
+            transcription_id: transcription.id,
+            audio_id: stored.id,
+            order: i + 1,
+            original_name: f.originalname,
+          }),
+        );
+      }
+    } catch (error: any) {
+      // The row already exists, so a failure here used to leave it `pending`
+      // for ever with no audio attached and nothing running: the upload error
+      // went back as a 500 while the row sat in the list looking queued. Mark
+      // it failed so the state is honest and the recording can be dealt with.
+      this.logger.error(
+        `[Create] Transcription ${transcription.id}: storing audio failed: ${error?.message}`,
+      );
+      await this.setStatus(
+        transcription.id,
+        TranscriptionStatus.FAILED,
+        `خطا در ذخیره فایل صوتی: ${error?.message ?? 'نامشخص'}`,
+      );
+      localPaths.forEach((p) => this.audioProcessor.safeUnlink(p));
+      throw new HttpException(
+        `فایل صوتی ذخیره نشد: ${error?.message ?? 'نامشخص'}`,
+        500,
       );
     }
 
@@ -131,6 +163,123 @@ export class TranscriptionService {
     });
 
     return transcription;
+  }
+
+  /**
+   * Run the pipeline again for a recording that did not make it through.
+   *
+   * Without this a single upstream hiccup — a Pyannote job that comes back
+   * `failed: unknown error`, a network blip during speech-to-text — is a dead
+   * end: the recording is stuck on a page with nothing but the error on it, and
+   * the only way forward is deleting it and uploading the audio again.
+   *
+   * The original uploads are still in S3, so a retry re-downloads them and
+   * re-enters the exact same pipeline. Nothing is resumed from halfway: the
+   * Soniox tokens are only written once diarization has succeeded too, so after
+   * a diarization failure there is no partial result worth keeping.
+   */
+  async retryProcessing(id: number): Promise<any> {
+    const t = await this.transcriptionRepo.findOne({
+      where: { id },
+      relations: ['audioFiles'],
+    });
+    if (!t) throw new HttpException('رونویسی یافت نشد', 404);
+
+    if (
+      t.status === TranscriptionStatus.COMPLETED ||
+      t.status === TranscriptionStatus.AWAITING_MAPPING
+    ) {
+      throw new HttpException('این رونویسی با موفقیت پردازش شده است', 400);
+    }
+
+    const idleMs = Date.now() - new Date(t.updated_at ?? 0).getTime();
+    if (t.status !== TranscriptionStatus.FAILED && idleMs < STALE_RUN_MS) {
+      throw new HttpException('پردازش این رونویسی در حال اجراست', 409);
+    }
+
+    // Prefer the original uploads (in order) — the same input the first run had.
+    // The processed MP3 is the fallback for rows whose originals are gone.
+    const sources = [...(t.audioFiles ?? [])]
+      .sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+      .map((audio) => ({
+        key: audio.audio?.path,
+        name: audio.original_name || audio.audio?.name || `audio-${audio.id}`,
+      }))
+      .filter(
+        (source): source is { key: string; name: string } => !!source.key,
+      );
+
+    if (sources.length === 0 && t.processed_audio?.path) {
+      sources.push({
+        key: t.processed_audio.path,
+        name: `transcription_${id}_processed.mp3`,
+      });
+    }
+
+    if (sources.length === 0) {
+      throw new HttpException(
+        'فایل صوتی این رونویسی در انبار موجود نیست، پس پردازش دوباره ممکن نیست',
+        422,
+      );
+    }
+
+    await this.setStatus(
+      id,
+      TranscriptionStatus.PROCESSING,
+      'در حال آماده‌سازی برای پردازش دوباره...',
+    );
+
+    this.restartProcessing(id, sources).catch((error) => {
+      this.logger.error(
+        `[Retry] Transcription ${id} could not be restarted: ${error?.message}`,
+      );
+    });
+
+    return this.getStatus(id);
+  }
+
+  /** Bring the audio back to local disk, then hand it to the normal pipeline. */
+  private async restartProcessing(
+    id: number,
+    sources: Array<{ key: string; name: string }>,
+  ): Promise<void> {
+    this.logger.log(
+      `[Retry] Transcription ${id}: re-downloading ${sources.length} file(s)`,
+    );
+
+    const dir = path.join(process.cwd(), 'temp', 'uploads');
+    fs.mkdirSync(dir, { recursive: true });
+
+    const localPaths: string[] = [];
+    try {
+      for (let i = 0; i < sources.length; i++) {
+        const buffer = await this.fileService.downloadFileFromS3(
+          sources[i].key,
+        );
+        const target = path.join(
+          dir,
+          `retry-${id}-${Date.now()}-${i}${path.extname(sources[i].name) || '.mp3'}`,
+        );
+        fs.writeFileSync(target, buffer);
+        localPaths.push(target);
+      }
+    } catch (error: any) {
+      // The download is the one part outside `processTranscription`, so its
+      // failure has to be reported the same way the pipeline reports its own.
+      this.logger.error(
+        `[Retry] Transcription ${id}: download failed: ${error?.message}`,
+      );
+      localPaths.forEach((p) => this.audioProcessor.safeUnlink(p));
+      await this.setStatus(
+        id,
+        TranscriptionStatus.FAILED,
+        `خطا در دریافت فایل صوتی برای پردازش دوباره: ${error?.message ?? 'نامشخص'}`,
+      );
+      return;
+    }
+
+    // Cleans up `localPaths` itself, and owns the status from here on.
+    await this.processTranscription(id, localPaths);
   }
 
   /**
