@@ -10,6 +10,28 @@ import { configureFfmpeg } from './libs/ffmpeg/ffmpeg.util';
 // otherwise fail with HTTP 413 "request entity too large".
 const JSON_BODY_LIMIT = '25mb';
 
+/**
+ * How long a single request may take.
+ *
+ * Node's default is 5 minutes, and it closes the socket the moment it is hit —
+ * which the browser reports as a bare "network error", indistinguishable from a
+ * lost connection. Uploading a two-hour recording on a normal uplink takes longer
+ * than that, so large uploads were failing at the five-minute mark, repeatedly.
+ *
+ * Audio now arrives in chunks (see UploadModule), each of which finishes in
+ * seconds, so this ceiling is only a safety net — for the single-request upload
+ * path that still exists, and for a slow S3 hand-off inside a request.
+ */
+const REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
+
+/**
+ * Keep-alive has to outlive the gap between chunk requests, and `headersTimeout`
+ * must stay above `keepAliveTimeout` or Node races itself and drops sockets that
+ * were about to be reused.
+ */
+const KEEP_ALIVE_TIMEOUT_MS = 75 * 1000;
+const HEADERS_TIMEOUT_MS = 80 * 1000;
+
 async function bootstrap() {
   // Point fluent-ffmpeg at the bundled ffmpeg/ffprobe binaries.
   configureFfmpeg();
@@ -38,6 +60,11 @@ async function bootstrap() {
   );
 
   await app.listen(process.env.PORT ?? 3000, process.env.HOST ?? 'localhost');
+
+  const server = app.getHttpServer();
+  server.requestTimeout = REQUEST_TIMEOUT_MS;
+  server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
+  server.headersTimeout = HEADERS_TIMEOUT_MS;
 }
 
 bootstrap()

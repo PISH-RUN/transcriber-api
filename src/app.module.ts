@@ -13,6 +13,7 @@ import { ProjectModule } from './modules/project/project.module';
 import { AnalysisModule } from './modules/analysis/analysis.module';
 import { GlossaryModule } from './modules/glossary/glossary.module';
 import { EvidenceModule } from './modules/evidence/evidence.module';
+import { UploadModule } from './modules/upload/upload.module';
 import { TranscriptionModule } from './modules/transcription/transcription.module';
 import { AiExtractionModule } from './modules/ai-extraction/ai-extraction.module';
 import { APP_INTERCEPTOR } from '@nestjs/core';
@@ -30,6 +31,7 @@ import { ResponseInterceptor } from './libs/interceptors/response.interceptor';
     GlossaryModule,
     EvidenceModule,
     AnalysisModule,
+    UploadModule,
     TranscriptionModule,
     AiExtractionModule,
   ],

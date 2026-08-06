@@ -10,6 +10,7 @@ import { PersonModule } from '../person/person.module';
 import { ProjectModule } from '../project/project.module';
 import { AnalysisModule } from '../analysis/analysis.module';
 import { GlossaryModule } from '../glossary/glossary.module';
+import { UploadModule } from '../upload/upload.module';
 
 @Module({
   imports: [
@@ -23,6 +24,9 @@ import { GlossaryModule } from '../glossary/glossary.module';
     // For the automatic glossary scan after processing. GlossaryModule pulls in
     // the Transcription entity, not this module, so there is no cycle.
     GlossaryModule,
+    // A large recording arrives as a resumable chunked upload; creating the
+    // transcription then consumes the finished session.
+    UploadModule,
   ],
   controllers: [TranscriptionController],
   providers: [TranscriptionService],

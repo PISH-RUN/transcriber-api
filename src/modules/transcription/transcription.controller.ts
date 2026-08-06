@@ -23,13 +23,17 @@ import {
   ConfirmSpeakersDto,
   UpdateTranscriptionDto,
 } from './transcription.dto';
+import { UploadService } from '../upload/upload.service';
 
 const toUtf8 = (s: string) => Buffer.from(s, 'latin1').toString('utf8');
 
 @ApiTags('Transcriptions')
 @Controller('transcriptions')
 export class TranscriptionController {
-  constructor(private readonly transcriptionService: TranscriptionService) {}
+  constructor(
+    private readonly transcriptionService: TranscriptionService,
+    private readonly uploadService: UploadService,
+  ) {}
 
   @Get()
   @ApiOperation({
@@ -75,7 +79,8 @@ export class TranscriptionController {
   @ApiOperation({
     summary: 'Create a transcription from one or more audio files',
     description:
-      'Upload audio files (field "files"). Optionally pass "title" and "expected_person_ids" (JSON array or comma-separated) of people expected to be present, whose voiceprints drive auto speaker identification.',
+      'Either upload the audio directly (multipart field "files"), or pass "upload_ids" — sessions already finished through POST /uploads, which is how a long recording should be sent. ' +
+      'Optionally pass "title" and "expected_person_ids" (JSON array or comma-separated) of people expected to be present, whose voiceprints drive auto speaker identification.',
   })
   @UseInterceptors(
     FilesInterceptor('files', 20, {
@@ -108,24 +113,36 @@ export class TranscriptionController {
   async create(
     @UploadedFiles() files: Express.Multer.File[],
     @Body('title') title?: string,
-    @Body('expected_person_ids') expectedPersonIdsRaw?: string,
+    @Body('expected_person_ids') expectedPersonIdsRaw?: string | number[],
     @Body('description') description?: string,
     @Body('recorded_at') recordedAt?: string,
-    @Body('tags') tagsRaw?: string,
-    @Body('project_id') projectIdRaw?: string,
+    @Body('tags') tagsRaw?: string | string[],
+    @Body('project_id') projectIdRaw?: string | number,
     @Body('project_name') projectName?: string,
+    @Body('upload_ids') uploadIdsRaw?: string | string[],
   ) {
-    if (!files || files.length === 0) {
+    // Two ways in. Small files may still come as one multipart body; a long
+    // recording arrives beforehand through the resumable upload endpoints and is
+    // referenced here by session id, because a single 500MB request does not
+    // survive a real network (see UploadService).
+    const sources = files?.length
+      ? files.map((f) => ({
+          path: f.path,
+          originalname: toUtf8(f.originalname),
+        }))
+      : this.parseIdList(uploadIdsRaw).map((id) => this.uploadService.take(id));
+
+    if (sources.length === 0) {
       throw new BadRequestException('حداقل یک فایل صوتی لازم است');
     }
 
     const expectedPersonIds = this.parsePersonIds(expectedPersonIdsRaw);
     const resolvedTitle =
       title?.trim() ||
-      toUtf8(files[0].originalname).replace(/\.[^.]+$/, '') ||
+      sources[0].originalname.replace(/\.[^.]+$/, '') ||
       `رونویسی ${new Date().toLocaleString('fa-IR')}`;
 
-    const projectId = projectIdRaw ? parseInt(projectIdRaw, 10) : null;
+    const projectId = projectIdRaw ? parseInt(String(projectIdRaw), 10) : null;
 
     return this.transcriptionService.create({
       title: resolvedTitle,
@@ -135,10 +152,7 @@ export class TranscriptionController {
       tags: this.parseTags(tagsRaw),
       projectId: Number.isNaN(projectId as number) ? null : projectId,
       projectName: projectName || null,
-      files: files.map((f) => ({
-        path: f.path,
-        originalname: toUtf8(f.originalname),
-      })),
+      files: sources,
     });
   }
 
@@ -212,12 +226,40 @@ export class TranscriptionController {
     return this.transcriptionService.remove(id);
   }
 
-  /** Multipart values arrive as strings: accept a JSON array or a comma list. */
-  private parseTags(raw?: string): string[] {
+  /**
+   * Upload session ids, from a JSON body (already an array) or a multipart field
+   * (a JSON string, or comma-separated).
+   */
+  private parseIdList(raw?: string | string[]): string[] {
     if (!raw) return [];
-    const trimmed = raw.trim();
+    if (Array.isArray(raw)) return raw.map((id) => String(id).trim()).filter(Boolean);
+
+    const trimmed = String(raw).trim();
     try {
-      const parsed = JSON.parse(trimmed);
+      const parsed: unknown = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) {
+        return parsed.map((id) => String(id).trim()).filter(Boolean);
+      }
+    } catch {
+      // Not JSON — fall back to comma-separated.
+    }
+    return trimmed
+      .split(',')
+      .map((id) => id.trim())
+      .filter(Boolean);
+  }
+
+  /**
+   * Multipart values arrive as strings; a JSON body gives real arrays. Both are
+   * accepted, because this endpoint now takes either kind of request.
+   */
+  private parseTags(raw?: string | string[]): string[] {
+    if (!raw) return [];
+    if (Array.isArray(raw)) return raw.map((v) => String(v).trim()).filter(Boolean);
+
+    const trimmed = String(raw).trim();
+    try {
+      const parsed: unknown = JSON.parse(trimmed);
       if (Array.isArray(parsed)) return parsed.map((v) => String(v));
     } catch {
       // Not JSON — fall back to comma-separated.
@@ -242,22 +284,23 @@ export class TranscriptionController {
     return statuses.length ? statuses : undefined;
   }
 
-  private parsePersonIds(raw?: string): number[] {
+  private parsePersonIds(raw?: string | number[]): number[] {
     if (!raw) return [];
-    const trimmed = raw.trim();
+
+    const toIds = (values: unknown[]): number[] =>
+      values
+        .map((v) => parseInt(String(v), 10))
+        .filter((n) => !Number.isNaN(n));
+
+    if (Array.isArray(raw)) return toIds(raw);
+
+    const trimmed = String(raw).trim();
     try {
-      const parsed = JSON.parse(trimmed);
-      if (Array.isArray(parsed)) {
-        return parsed
-          .map((v) => parseInt(String(v), 10))
-          .filter((n) => !Number.isNaN(n));
-      }
+      const parsed: unknown = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) return toIds(parsed);
     } catch {
       // Not JSON — fall back to comma-separated.
     }
-    return trimmed
-      .split(',')
-      .map((s) => parseInt(s.trim(), 10))
-      .filter((n) => !Number.isNaN(n));
+    return toIds(trimmed.split(','));
   }
 }
