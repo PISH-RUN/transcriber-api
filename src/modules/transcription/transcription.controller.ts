@@ -184,9 +184,9 @@ export class TranscriptionController {
 
   @Post(':id/retry')
   @ApiOperation({
-    summary: 'Run the processing pipeline again for a failed recording',
+    summary: 'Resume the processing pipeline for a failed recording',
     description:
-      'Re-downloads the original uploads from storage and re-enters the pipeline from the start. Allowed for failed recordings, and for runs that have been silent long enough to be presumed dead. Returns immediately — poll GET /transcriptions/:id/status.',
+      'Re-enters the pipeline and continues from the first unfinished step: steps that already produced a result (audio preparation, speech-to-text, diarization, samples) are reused, only the failed step onward runs again. The originals are re-downloaded only when audio preparation never finished. Allowed for failed recordings, and for runs silent long enough to be presumed dead. Returns immediately — poll GET /transcriptions/:id/status.',
   })
   retry(@Param('id', ParseIntPipe) id: number) {
     return this.transcriptionService.retryProcessing(id);

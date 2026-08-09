@@ -173,10 +173,12 @@ export class TranscriptionService {
    * end: the recording is stuck on a page with nothing but the error on it, and
    * the only way forward is deleting it and uploading the audio again.
    *
-   * The original uploads are still in S3, so a retry re-downloads them and
-   * re-enters the exact same pipeline. Nothing is resumed from halfway: the
-   * Soniox tokens are only written once diarization has succeeded too, so after
-   * a diarization failure there is no partial result worth keeping.
+   * The retry resumes rather than restarts: every step that already produced a
+   * result is reused, so a failure at diarization keeps the processed audio and
+   * the (paid-for) Soniox transcript and only re-runs from diarization on. When
+   * audio preparation itself finished, the processed MP3 in storage is enough —
+   * the originals aren't re-downloaded at all. Only a row whose preparation
+   * never completed needs the originals fetched back to disk first.
    */
   async retryProcessing(id: number): Promise<any> {
     const t = await this.transcriptionRepo.findOne({
@@ -197,8 +199,26 @@ export class TranscriptionService {
       throw new HttpException('پردازش این رونویسی در حال اجراست', 409);
     }
 
-    // Prefer the original uploads (in order) — the same input the first run had.
-    // The processed MP3 is the fallback for rows whose originals are gone.
+    // Audio preparation already produced the processed MP3: resume straight from
+    // the first unfinished step. The pipeline pulls the processed audio from
+    // storage itself when a later step needs it, so nothing is re-downloaded or
+    // re-transcoded here.
+    if (t.processed_audio?.path) {
+      await this.setStatus(
+        id,
+        TranscriptionStatus.PROCESSING,
+        'در حال ادامه پردازش...',
+      );
+      this.processTranscription(id, []).catch((error) => {
+        this.logger.error(
+          `[Retry] Transcription ${id} could not be resumed: ${error?.message}`,
+        );
+      });
+      return this.getStatus(id);
+    }
+
+    // Preparation never finished, so the pipeline has to start from the top and
+    // needs the original uploads (in order) back on local disk.
     const sources = [...(t.audioFiles ?? [])]
       .sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
       .map((audio) => ({
@@ -208,13 +228,6 @@ export class TranscriptionService {
       .filter(
         (source): source is { key: string; name: string } => !!source.key,
       );
-
-    if (sources.length === 0 && t.processed_audio?.path) {
-      sources.push({
-        key: t.processed_audio.path,
-        name: `transcription_${id}_processed.mp3`,
-      });
-    }
 
     if (sources.length === 0) {
       throw new HttpException(
@@ -767,107 +780,180 @@ export class TranscriptionService {
   // Background processing pipeline
   // ---------------------------------------------------------------------------
 
+  /**
+   * Run (or resume) the pipeline for a transcription.
+   *
+   * Each step's output is persisted the moment it succeeds, and every step is
+   * skipped when its result is already on the row. So a run that died at, say,
+   * diarization is retried by re-entering here: audio preparation and
+   * speech-to-text are reused as-is and only diarization onward runs again —
+   * no repeated transcoding, no second Soniox bill.
+   *
+   * `localPaths` are the source uploads and are only needed when audio
+   * preparation has not produced the processed MP3 yet; a resume past that
+   * point ignores them and pulls the processed audio from storage on demand.
+   */
   async processTranscription(id: number, localPaths: string[]): Promise<void> {
     this.logger.log(`[Process] Starting transcription ${id}`);
-    let processedPath: string | null = null;
+    let localProcessedPath: string | null = null;
+    let ownsLocalProcessed = false;
 
     try {
-      await this.setStatus(
-        id,
-        TranscriptionStatus.PROCESSING,
-        'در حال آماده‌سازی صدا...',
-      );
+      const row = await this.loadPipelineState(id);
 
-      // 1. Produce a single processed MP3 (merge if multiple).
-      processedPath =
-        localPaths.length === 1
-          ? await this.audioProcessor.transcodeToStreamingMp3(localPaths[0])
-          : (await this.audioProcessor.mergeAudioFiles(localPaths)).mergedPath;
+      // 1. Audio preparation → a single processed MP3 stored in S3.
+      let processedS3Key: string;
+      if (row.processed_audio?.path) {
+        this.logger.log(`[Process ${id}] audio already prepared — skipping`);
+        processedS3Key = row.processed_audio.path;
+      } else {
+        await this.setStatus(
+          id,
+          TranscriptionStatus.PROCESSING,
+          'در حال آماده‌سازی صدا...',
+        );
+        if (!localPaths?.length) {
+          throw new Error('فایل صوتی برای آماده‌سازی موجود نیست');
+        }
+        localProcessedPath =
+          localPaths.length === 1
+            ? await this.audioProcessor.transcodeToStreamingMp3(localPaths[0])
+            : (await this.audioProcessor.mergeAudioFiles(localPaths)).mergedPath;
+        ownsLocalProcessed = true;
 
-      // 2. Store the processed audio in S3 and link it.
-      const processedFile = await this.fileService.uploadFileFromPath(
-        processedPath,
-        {
-          file_type: 'audio',
-          name: `transcription_${id}_processed.mp3`,
-          user: null,
-        },
-      );
-      const duration =
-        await this.audioProcessor.getAudioDuration(processedPath);
-      await this.transcriptionRepo.update(id, {
-        processed_audio_id: processedFile.id,
-        duration,
-      });
+        const processedFile = await this.fileService.uploadFileFromPath(
+          localProcessedPath,
+          {
+            file_type: 'audio',
+            name: `transcription_${id}_processed.mp3`,
+            user: null,
+          },
+        );
+        const duration =
+          await this.audioProcessor.getAudioDuration(localProcessedPath);
+        await this.transcriptionRepo.update(id, {
+          processed_audio_id: processedFile.id,
+          duration,
+        });
+        processedS3Key = processedFile.path;
+      }
 
       const audioUrl = await this.fileService.getPresignedUrl(
-        processedFile.path,
+        processedS3Key,
         PLAYBACK_URL_TTL,
       );
 
-      // 3. Speech-to-text (Soniox).
-      await this.setStatus(
-        id,
-        TranscriptionStatus.PROCESSING,
-        'در حال تبدیل گفتار به متن...',
-      );
-      const { tokens } = await this.runSoniox(audioUrl, processedPath, id);
+      // Bring the processed MP3 to local disk, but only when a step actually
+      // needs bytes on disk (the Soniox upload fallback, sample extraction).
+      // A fresh run already has it; a resume downloads it once.
+      const ensureLocalProcessed = async (): Promise<string> => {
+        if (localProcessedPath) return localProcessedPath;
+        this.logger.log(
+          `[Process ${id}] fetching processed audio to local disk`,
+        );
+        const buffer = await this.fileService.downloadFileFromS3(processedS3Key);
+        const dir = path.join(process.cwd(), 'temp', 'audio');
+        fs.mkdirSync(dir, { recursive: true });
+        const target = path.join(dir, `resume-${id}-${Date.now()}.mp3`);
+        fs.writeFileSync(target, buffer);
+        localProcessedPath = target;
+        ownsLocalProcessed = true;
+        return target;
+      };
 
-      // 4. Diarization / identification (Pyannote).
-      await this.setStatus(
-        id,
-        TranscriptionStatus.PROCESSING,
-        'در حال تشخیص گویندگان...',
-      );
-      const expectedPersonIds = (await this.getExpectedPersonIds(id)) ?? [];
-      const { diarization, suggestedMap, source } = await this.runDiarization(
-        audioUrl,
-        expectedPersonIds,
-      );
+      // 2. Speech-to-text (Soniox).
+      let tokens: SonioxToken[];
+      if (row.stt_tokens?.length) {
+        this.logger.log(
+          `[Process ${id}] speech-to-text already done (${row.stt_tokens.length} tokens) — skipping`,
+        );
+        tokens = row.stt_tokens as any;
+      } else {
+        await this.setStatus(
+          id,
+          TranscriptionStatus.PROCESSING,
+          'در حال تبدیل گفتار به متن...',
+        );
+        tokens = (await this.runSoniox(audioUrl, ensureLocalProcessed, id))
+          .tokens;
+        await this.transcriptionRepo.update(id, { stt_tokens: tokens as any });
+      }
 
-      // 5. Merge transcript + diarization.
-      const segments = this.merger.mergeTranscripts(diarization, tokens);
-      const rawText = this.merger.generateRawText(segments);
-
-      await this.transcriptionRepo
-        .createQueryBuilder()
-        .update()
-        .set({
-          stt_tokens: tokens as any,
+      // 3. Diarization / identification (Pyannote).
+      let diarization: PyannoteSegment[];
+      let suggestedMap: Record<
+        string,
+        { personId: number; confidence: number }
+      >;
+      if (row.diarization_source) {
+        this.logger.log(
+          `[Process ${id}] diarization already done (${row.diarization_source}) — skipping`,
+        );
+        diarization = (row.diarization ?? []) as any;
+        // The suggested speaker→person map isn't persisted (it can't be added
+        // without a schema change, and prod runs without synchronize). Resuming
+        // past diarization therefore starts speaker mapping without pre-filled
+        // suggestions — the samples and manual mapping are unaffected.
+        suggestedMap = {};
+      } else {
+        await this.setStatus(
+          id,
+          TranscriptionStatus.PROCESSING,
+          'در حال تشخیص گویندگان...',
+        );
+        const expectedPersonIds = row.expected_person_ids ?? [];
+        const result = await this.runDiarization(audioUrl, expectedPersonIds);
+        diarization = result.diarization;
+        suggestedMap = result.suggestedMap;
+        await this.transcriptionRepo.update(id, {
           diarization: diarization as any,
+          diarization_source: result.source,
+        });
+      }
+
+      // 4. Merge transcript + diarization into speaker-attributed segments.
+      if (row.segments?.length) {
+        this.logger.log(`[Process ${id}] segments already built — skipping`);
+      } else {
+        const segments = this.merger.mergeTranscripts(diarization, tokens);
+        await this.transcriptionRepo.update(id, {
           segments: segments as any,
-          raw_text: rawText,
-          diarization_source: source,
-        })
-        .where('id = :id', { id })
-        .execute();
+          raw_text: this.merger.generateRawText(segments),
+        });
+      }
 
-      // 6. Per-speaker audio samples (extracted from the local processed file).
-      await this.setStatus(
-        id,
-        TranscriptionStatus.PROCESSING,
-        'در حال تولید نمونه صدای گویندگان...',
-      );
-      await this.transcriptionRepo.update(id, {
-        speaker_samples_status: 'processing',
-      });
-      const effectiveDiarization =
-        diarization.length > 0
-          ? diarization
-          : this.deriveDiarizationFromTokens(tokens);
-      const samples = await this.buildSpeakerSamples(
-        id,
-        processedPath,
-        effectiveDiarization,
-        tokens,
-        suggestedMap,
-      );
-      await this.transcriptionRepo.update(id, {
-        speaker_samples: samples,
-        speaker_samples_status: samples.length > 0 ? 'done' : 'failed',
-      });
+      // 5. Per-speaker audio samples (extracted from the processed file).
+      if (row.speaker_samples_status === 'done' && row.speaker_samples?.length) {
+        this.logger.log(
+          `[Process ${id}] speaker samples already done — skipping`,
+        );
+      } else {
+        await this.setStatus(
+          id,
+          TranscriptionStatus.PROCESSING,
+          'در حال تولید نمونه صدای گویندگان...',
+        );
+        await this.transcriptionRepo.update(id, {
+          speaker_samples_status: 'processing',
+        });
+        const effectiveDiarization =
+          diarization.length > 0
+            ? diarization
+            : this.deriveDiarizationFromTokens(tokens);
+        const samples = await this.buildSpeakerSamples(
+          id,
+          await ensureLocalProcessed(),
+          effectiveDiarization,
+          tokens,
+          suggestedMap,
+        );
+        await this.transcriptionRepo.update(id, {
+          speaker_samples: samples,
+          speaker_samples_status: samples.length > 0 ? 'done' : 'failed',
+        });
+      }
 
-      // 7. Ready for the user to confirm speaker → person mapping.
+      // 6. Ready for the user to confirm speaker → person mapping.
       await this.setStatus(
         id,
         TranscriptionStatus.AWAITING_MAPPING,
@@ -885,14 +971,30 @@ export class TranscriptionService {
       );
     } finally {
       // Cleanup local temp files.
-      this.audioProcessor.safeUnlink(processedPath);
+      if (ownsLocalProcessed) this.audioProcessor.safeUnlink(localProcessedPath);
       localPaths.forEach((p) => this.audioProcessor.safeUnlink(p));
     }
   }
 
+  /**
+   * Load a transcription with the heavy, normally-unselected pipeline columns
+   * (`stt_tokens`, `diarization`) and the processed-audio relation, so a
+   * resume can tell which steps already have a result to reuse.
+   */
+  private async loadPipelineState(id: number): Promise<Transcription> {
+    const row = await this.transcriptionRepo
+      .createQueryBuilder('t')
+      .leftJoinAndSelect('t.processed_audio', 'processed_audio')
+      .addSelect(['t.stt_tokens', 't.diarization'])
+      .where('t.id = :id', { id })
+      .getOne();
+    if (!row) throw new HttpException('رونویسی یافت نشد', 404);
+    return row;
+  }
+
   private async runSoniox(
     audioUrl: string,
-    localPath: string,
+    getLocalPath: () => Promise<string>,
     id: number,
   ): Promise<{ tokens: SonioxToken[] }> {
     if (!this.soniox.isConfigured()) {
@@ -908,8 +1010,10 @@ export class TranscriptionService {
       this.logger.warn(
         `Soniox audio_url path failed for ${id}, falling back to file upload`,
       );
+      // Only now do we need the audio on local disk — fetch it on demand so a
+      // resume whose URL path succeeds never pays for the download.
       const { tokens } = await this.soniox.transcribeWithSonioxFile(
-        localPath,
+        await getLocalPath(),
         `t${id}`,
       );
       return { tokens };
@@ -1313,15 +1417,6 @@ export class TranscriptionService {
       status,
       status_message: message,
     });
-  }
-
-  private async getExpectedPersonIds(id: number): Promise<number[] | null> {
-    const t = await this.transcriptionRepo
-      .createQueryBuilder('t')
-      .select(['t.id', 't.expected_person_ids'])
-      .where('t.id = :id', { id })
-      .getOne();
-    return t?.expected_person_ids ?? [];
   }
 
   /** Trim, drop blanks and de-duplicate tags; an empty list is stored as null. */
