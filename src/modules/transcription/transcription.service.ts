@@ -382,6 +382,12 @@ export class TranscriptionService {
       (transcription.speaker_samples ?? []).map(async (s) => ({
         ...s,
         audioUrl: await this.safePresign(s.audioPath),
+        // Separate URL so the mapping screen can offer the clip as a download
+        // (attachment) without affecting inline playback above.
+        downloadUrl: await this.safeDownloadUrl(
+          s.audioPath,
+          this.buildSampleFileName(transcription, s),
+        ),
         personId: transcription.speaker_map?.[s.speakerId] ?? null,
       })),
     );
@@ -1454,5 +1460,39 @@ export class TranscriptionService {
     } catch {
       return null;
     }
+  }
+
+  /** Presigned URL that downloads (rather than plays) a clip. */
+  private async safeDownloadUrl(
+    s3Key: string | null | undefined,
+    filename: string,
+  ): Promise<string | null> {
+    if (!s3Key) return null;
+    try {
+      return await this.fileService.getDownloadUrl(
+        s3Key,
+        filename,
+        PLAYBACK_URL_TTL,
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Name a downloaded speaker clip after its session and speaker, e.g.
+   * "جلسه هفتگی قطران - گوینده 2.mp3". Clips are always mp3 (see
+   * `buildSpeakerSamples`).
+   */
+  private buildSampleFileName(
+    transcription: Transcription,
+    sample: SpeakerSample,
+  ): string {
+    const title = (transcription.title || `رونویسی ${transcription.id}`)
+      .replace(/[\\/:*?"<>|]+/g, '_')
+      .trim();
+    const speaker = sample.speakerLabel || sample.speakerId;
+
+    return `${title} - ${speaker}.mp3`;
   }
 }

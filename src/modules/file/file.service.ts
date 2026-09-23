@@ -332,4 +332,70 @@ export class FileService {
       );
     }
   }
+
+  /**
+   * Presigned URL that makes the browser save the object instead of playing it
+   * inline.
+   *
+   * The disposition is signed into the URL (S3's `response-content-disposition`
+   * override), which is what makes a plain anchor click work: the HTML
+   * `download` attribute is ignored for cross-origin URLs, so the header has to
+   * come from S3 itself.
+   *
+   * @param s3Path - S3 key of the object
+   * @param filename - name the file should be saved as (Persian is fine)
+   * @param expiresIn - expiration time in seconds (default: 3600 = 1 hour)
+   */
+  async getDownloadUrl(
+    s3Path: string,
+    filename: string,
+    expiresIn: number = 3600,
+  ): Promise<string> {
+    // Local development / mock S3 has no signing, so the best we can offer is
+    // the plain public URL (no attachment header).
+    if (!this.s3Enabled) {
+      if (this.s3PublicUrl) {
+        return this.getPublicUrl(s3Path);
+      }
+      throw new BadRequestException('S3 and public URL are not configured');
+    }
+
+    try {
+      const command = new GetObjectCommand({
+        Bucket: this.bucketName,
+        Key: s3Path,
+        ResponseContentDisposition: this.buildAttachmentDisposition(filename),
+      });
+
+      return await getSignedUrl(this.s3Client, command, { expiresIn });
+    } catch (error) {
+      console.error('Error generating download URL:', error);
+      if (this.s3PublicUrl) {
+        console.log('Falling back to public URL');
+        return this.getPublicUrl(s3Path);
+      }
+      throw new InternalServerErrorException(
+        'Failed to generate download URL',
+      );
+    }
+  }
+
+  /**
+   * RFC 6266 `attachment` disposition: an ASCII-only `filename` for old agents
+   * plus a percent-encoded `filename*` so Persian names survive. Both parts are
+   * sanitised, so a filename can't inject extra header directives.
+   */
+  private buildAttachmentDisposition(filename: string): string {
+    const safe = (filename || 'download').replace(/[\r\n]+/g, ' ').trim();
+
+    // An all-Persian name leaves nothing usable after ASCII stripping, so keep
+    // the extension and use a generic base rather than a row of underscores.
+    const ext = /\.([a-zA-Z0-9]{1,8})$/.exec(safe)?.[1] ?? '';
+    const stripped = safe.replace(/[^a-zA-Z0-9_.-]+/g, '_');
+    const asciiFallback = /[a-zA-Z0-9]/.test(stripped.replace(/\.\w+$/, ''))
+      ? stripped
+      : `download${ext ? `.${ext}` : ''}`;
+
+    return `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodeURIComponent(safe)}`;
+  }
 }
