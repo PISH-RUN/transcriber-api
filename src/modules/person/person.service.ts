@@ -1,5 +1,6 @@
 import { HttpException, Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
+import { createHash } from 'crypto';
 import { In, Repository } from 'typeorm';
 import { Person } from './person.entity';
 import { CreatePersonDto, UpdatePersonDto } from './person.dto';
@@ -8,6 +9,19 @@ import { PyannoteService, PyannoteVoiceprintInput } from '../audio/pyannote.serv
 import { AudioProcessorService } from '../audio/audio-processor.service';
 
 const VOICEPRINT_URL_TTL = 6 * 60 * 60; // 6h — pyannote jobs can take a while
+
+/** A library voiceprint, ready to send to an identify job. */
+export interface VoiceprintCandidate {
+  personId: number;
+  /** Pyannote label — the person id as a string, as everywhere else. */
+  label: string;
+  voiceprint: string;
+  /**
+   * Changes whenever the voiceprint is re-created: each creation comes from a
+   * new clip, and `sample_audio_path` points at it.
+   */
+  version: string;
+}
 
 @Injectable()
 export class PersonService {
@@ -90,6 +104,63 @@ export class PersonService {
     return rows
       .filter((p) => !!p.voiceprint)
       .map((p) => ({ label: String(p.id), voiceprint: p.voiceprint as string }));
+  }
+
+  /**
+   * The voiceprint library, for matching an already-processed recording's
+   * speakers after the fact — at most `limit` people, because one pyannote
+   * identify job takes at most 50 voiceprints.
+   *
+   * `preferredIds` go first, in the order given; the rest of the library
+   * follows, most recently updated first. The order only decides who is left
+   * out once the library outgrows the cap.
+   */
+  async getVoiceprintCandidates(
+    preferredIds: number[],
+    limit: number,
+  ): Promise<VoiceprintCandidate[]> {
+    // Rank on the light columns first, so only the chosen blobs are loaded.
+    const library = await this.personRepo.find({
+      select: { id: true, sample_audio_path: true, updated_at: true },
+      where: { has_voiceprint: true },
+      order: { updated_at: 'DESC' },
+    });
+    if (library.length === 0 || limit <= 0) return [];
+
+    const rank = new Map<number, number>();
+    preferredIds.forEach((id, index) => {
+      if (!rank.has(id)) rank.set(id, index);
+    });
+    const unranked = Number.MAX_SAFE_INTEGER;
+    const chosen = [...library]
+      .sort(
+        (a, b) => (rank.get(a.id) ?? unranked) - (rank.get(b.id) ?? unranked),
+      )
+      .slice(0, limit);
+
+    const rows = await this.personRepo
+      .createQueryBuilder('person')
+      .select(['person.id'])
+      .addSelect('person.voiceprint')
+      .where('person.id IN (:...ids)', { ids: chosen.map((p) => p.id) })
+      .getMany();
+    const voiceprintById = new Map(rows.map((p) => [p.id, p.voiceprint]));
+
+    return chosen.flatMap((p) => {
+      const voiceprint = voiceprintById.get(p.id);
+      if (!voiceprint) return [];
+      return [
+        {
+          personId: p.id,
+          label: String(p.id),
+          voiceprint,
+          version: createHash('sha1')
+            .update(p.sample_audio_path ?? '')
+            .digest('hex')
+            .slice(0, 10),
+        },
+      ];
+    });
   }
 
   async findByIds(personIds: number[]): Promise<Person[]> {

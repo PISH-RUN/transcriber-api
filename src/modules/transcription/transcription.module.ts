@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { Transcription, TranscriptionAudio } from './transcription.entity';
 import { TranscriptionService } from './transcription.service';
+import { SpeakerIdentificationService } from './speaker-identification.service';
 import { TranscriptionController } from './transcription.controller';
 import { AiModule } from '../ai/ai.module';
 import { FileModule } from '../file/file.module';
@@ -29,7 +30,7 @@ import { UploadModule } from '../upload/upload.module';
     UploadModule,
   ],
   controllers: [TranscriptionController],
-  providers: [TranscriptionService],
+  providers: [TranscriptionService, SpeakerIdentificationService],
   exports: [TranscriptionService],
 })
 export class TranscriptionModule {}

@@ -22,6 +22,7 @@ import {
   SonioxToken,
   TranscriptMergerService,
 } from '../audio/transcript-merger.service';
+import { SpeakerIdentificationService } from './speaker-identification.service';
 
 const PLAYBACK_URL_TTL = 6 * 60 * 60; // 6h
 
@@ -82,6 +83,7 @@ export class TranscriptionService {
     private readonly projectService: ProjectService,
     private readonly analysisService: AnalysisService,
     private readonly glossaryScan: GlossaryScanService,
+    private readonly speakerIdentification: SpeakerIdentificationService,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -413,6 +415,9 @@ export class TranscriptionService {
       persons,
       ai_refine_available: this.refiner.isConfigured(),
       can_revert_refine: await this.hasRefineBackup(id),
+      // Voiceprint matching of unassigned speakers after processing — polled by
+      // the mapping screen while it runs.
+      ...this.speakerIdentification.getState(id),
     };
   }
 
@@ -432,7 +437,7 @@ export class TranscriptionService {
     if (!t) {
       throw new HttpException('رونویسی یافت نشد', 404);
     }
-    return t;
+    return { ...t, ...this.speakerIdentification.getState(id) };
   }
 
   /**

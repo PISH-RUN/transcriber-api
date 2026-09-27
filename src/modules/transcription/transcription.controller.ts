@@ -19,6 +19,7 @@ import * as path from 'path';
 import { ApiConsumes, ApiOperation, ApiQuery, ApiTags } from '@nestjs/swagger';
 import { TranscriptionStatus } from './transcription.entity';
 import { TranscriptionService } from './transcription.service';
+import { SpeakerIdentificationService } from './speaker-identification.service';
 import {
   ConfirmSpeakersDto,
   UpdateTranscriptionDto,
@@ -33,6 +34,7 @@ export class TranscriptionController {
   constructor(
     private readonly transcriptionService: TranscriptionService,
     private readonly uploadService: UploadService,
+    private readonly speakerIdentification: SpeakerIdentificationService,
   ) {}
 
   @Get()
@@ -167,6 +169,17 @@ export class TranscriptionController {
     @Body() dto: ConfirmSpeakersDto,
   ) {
     return this.transcriptionService.confirmSpeakers(id, dto.assignments);
+  }
+
+  @Post(':id/identify-speakers')
+  @ApiOperation({
+    summary:
+      'Suggest people for unassigned speakers from the voiceprint library',
+    description:
+      'For a recording awaiting speaker mapping, compares each speaker’s sample clip with the voiceprints in the library as it is now — including voiceprints created by mapping other recordings after this one was processed — and stores the matches as suggestions (`suggestedPersonId` / `suggestedConfidence`). Nothing is confirmed. Speakers already compared with every current voiceprint are skipped, so calling it again is free unless the library changed. Returns immediately with `started`; poll GET /transcriptions/:id/status for `speaker_identify_status` / `speaker_identify_message`.',
+  })
+  identifySpeakers(@Param('id', ParseIntPipe) id: number) {
+    return this.speakerIdentification.start(id);
   }
 
   @Patch(':id')

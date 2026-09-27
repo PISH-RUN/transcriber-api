@@ -22,6 +22,13 @@ export interface SpeakerSample {
   sampleEnd: number;
   suggestedPersonId?: number | null; // auto-match from voiceprint identify
   suggestedConfidence?: number | null;
+  /**
+   * Voiceprints this sample was compared against after processing, as
+   * `<personId>:<voiceprint version>` (see SpeakerIdentificationService). It is
+   * what lets re-opening an unmapped recording skip pyannote unless the library
+   * gained or re-created a voiceprint since.
+   */
+  voiceprintsChecked?: string[];
 }
 
 @Entity('transcriptions')
