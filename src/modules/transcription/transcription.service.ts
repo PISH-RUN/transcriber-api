@@ -1,6 +1,7 @@
 import { HttpException, Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Brackets, Repository } from 'typeorm';
+import type { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
 import * as fs from 'fs';
 import * as path from 'path';
 import {
@@ -23,6 +24,8 @@ import {
   TranscriptMergerService,
 } from '../audio/transcript-merger.service';
 import { SpeakerIdentificationService } from './speaker-identification.service';
+import { EvidenceService } from '../evidence/evidence.service';
+import type { ReprocessStep } from './transcription.dto';
 
 const PLAYBACK_URL_TTL = 6 * 60 * 60; // 6h
 
@@ -38,6 +41,67 @@ const PLAYBACK_URL_TTL = 6 * 60 * 60; // 6h
 const STALE_RUN_MS = 2 * 60 * 60 * 1000; // 2h
 const TARGET_SAMPLE_DURATION = 30; // seconds
 const ALLOWED_OVERLAP_SECONDS = 1.0;
+
+/** Statuses in which a pipeline run may still be working on the row. */
+const RUNNING_STATUSES: TranscriptionStatus[] = [
+  TranscriptionStatus.PENDING,
+  TranscriptionStatus.PROCESSING,
+];
+
+/** How long the notice of a failed re-run stays on the recording. */
+const REPROCESS_NOTICE_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** A re-run of a paid step that failed; the recording was left as it was. */
+export interface ReprocessFailure {
+  step: ReprocessStep;
+  message: string;
+  /** ISO timestamp. */
+  at: string;
+}
+
+interface ProcessOptions {
+  /**
+   * Speaker → person suggestions from a diarization that ran before the call
+   * (see `reprocess`). The pipeline then skips diarization, and would otherwise
+   * lose them with it.
+   */
+  suggestedMap?: Record<string, { personId: number; confidence: number }>;
+}
+
+function describeError(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return typeof error === 'string' && error ? error : 'نامشخص';
+}
+
+/**
+ * An update payload. TypeORM's type has no `null` for columns whose TypeScript
+ * type lacks it, though they are nullable in the database — and emptying
+ * columns is exactly what a re-run does.
+ */
+function rowPatch(
+  fields: Record<string, unknown>,
+): QueryDeepPartialEntity<Transcription> {
+  return fields as QueryDeepPartialEntity<Transcription>;
+}
+
+/**
+ * Everything built from the recording's lines, emptied when their inputs are
+ * run again so the resumable pipeline builds it anew: the lines, both
+ * transcripts, the speaker samples (numbered after the lines), and the AI
+ * proof-reading state — whose "back to the original" snapshot is a version of
+ * text that will no longer exist.
+ */
+const CLEARED_LINES: Readonly<Record<string, null>> = {
+  segments: null,
+  raw_text: null,
+  final_text: null,
+  speaker_samples: null,
+  speaker_samples_status: null,
+  segments_before_refine: null,
+  refine_status: null,
+  refine_message: null,
+  refined_at: null,
+};
 
 export interface CreateTranscriptionInput {
   title: string;
@@ -68,6 +132,13 @@ export interface ListTranscriptionsFilter {
 export class TranscriptionService {
   private readonly logger = new Logger(TranscriptionService.name);
 
+  /**
+   * Re-runs whose paid step failed, per recording. In memory like the pipeline
+   * itself: the notice is only a notice — the recording was left intact — so
+   * losing it on a restart costs nothing.
+   */
+  private readonly reprocessFailures = new Map<number, ReprocessFailure>();
+
   constructor(
     @InjectRepository(Transcription)
     private readonly transcriptionRepo: Repository<Transcription>,
@@ -84,6 +155,7 @@ export class TranscriptionService {
     private readonly analysisService: AnalysisService,
     private readonly glossaryScan: GlossaryScanService,
     private readonly speakerIdentification: SpeakerIdentificationService,
+    private readonly evidenceService: EvidenceService,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -200,6 +272,7 @@ export class TranscriptionService {
     if (t.status !== TranscriptionStatus.FAILED && idleMs < STALE_RUN_MS) {
       throw new HttpException('پردازش این رونویسی در حال اجراست', 409);
     }
+    this.reprocessFailures.delete(id);
 
     // Audio preparation already produced the processed MP3: resume straight from
     // the first unfinished step. The pipeline pulls the processed audio from
@@ -297,12 +370,269 @@ export class TranscriptionService {
     await this.processTranscription(id, localPaths);
   }
 
+  // ---------------------------------------------------------------------------
+  // Re-running a paid step
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Run speech-to-text or speaker diarization again for a recording that was
+   * already processed (or failed after its audio was prepared), then let the
+   * resumable pipeline rebuild what comes after it and end at speaker mapping.
+   *
+   * - `transcribe` — a new Soniox pass. Diarization is kept, so the speakers,
+   *   and the people already assigned to them, stay as they are.
+   * - `diarize` — a new pyannote pass over the stored transcript. Speaker ids
+   *   change with it, so the speaker map goes.
+   *
+   * The paid call runs before anything is cleared. A re-run that fails — an
+   * upstream error, the key running out of credit — leaves the recording
+   * exactly as it was, with `reprocess_failure` saying why; clearing first
+   * would have left a recording that had a transcript with none at all, and no
+   * way back while the service stays down. Returns right away.
+   */
+  async reprocess(id: number, step: ReprocessStep): Promise<any> {
+    const t = await this.transcriptionRepo.findOne({ where: { id } });
+    if (!t) throw new HttpException('رونویسی یافت نشد', 404);
+
+    if (!t.processed_audio?.path) {
+      throw new HttpException(
+        'صدای آماده‌شده این رونویسی موجود نیست؛ به‌جای آن «پردازش دوباره» را بزنید',
+        422,
+      );
+    }
+    if (step === 'diarize') {
+      if (!this.pyannote.isConfigured()) {
+        throw new HttpException(
+          'سرویس تشخیص گوینده (pyannote) تنظیم نشده است',
+          503,
+        );
+      }
+      if (!(await this.hasSttTokens(id))) {
+        throw new HttpException(
+          'گفتار این رونویسی هنوز به متن تبدیل نشده است؛ به‌جای آن «پردازش دوباره» را بزنید',
+          422,
+        );
+      }
+    } else if (!this.soniox.isConfigured()) {
+      throw new HttpException('SONIOX_API_KEY تنظیم نشده است', 503);
+    }
+    // Refinement writes the lines back when it ends — over the rebuilt ones.
+    if (t.refine_status === 'processing') {
+      throw new HttpException(
+        'اصلاح هوشمند متن در حال اجراست؛ بعد از پایانش دوباره تلاش کنید',
+        409,
+      );
+    }
+
+    const message =
+      step === 'transcribe'
+        ? 'در حال تبدیل دوباره گفتار به متن...'
+        : 'در حال تشخیص دوباره گویندگان...';
+    if (!(await this.claimForReprocess(id, message))) {
+      throw new HttpException('پردازش این رونویسی در حال اجراست', 409);
+    }
+    this.reprocessFailures.delete(id);
+    this.speakerIdentification.forget(id);
+
+    const previous = { status: t.status, message: t.status_message ?? null };
+    this.runReprocess(id, step, previous).catch((error: unknown) => {
+      this.logger.error(`[Reprocess ${id}] crashed: ${describeError(error)}`);
+    });
+
+    return this.getStatus(id);
+  }
+
+  /**
+   * Move the row to `processing` only if nothing is running on it, in one
+   * UPDATE — two quick clicks must not both start a paid re-run. A run silent
+   * for `STALE_RUN_MS` is presumed dead, as for `retryProcessing`. Both sides of
+   * the age check are the database's own session-local time, which is how
+   * `updated_at` is written.
+   */
+  private async claimForReprocess(
+    id: number,
+    message: string,
+  ): Promise<boolean> {
+    const result = await this.transcriptionRepo
+      .createQueryBuilder()
+      .update(Transcription)
+      .set({ status: TranscriptionStatus.PROCESSING, status_message: message })
+      .where('id = :id', { id })
+      .andWhere(
+        new Brackets((qb) => {
+          qb.where('status IN (:...settled)', {
+            settled: [
+              TranscriptionStatus.COMPLETED,
+              TranscriptionStatus.AWAITING_MAPPING,
+              TranscriptionStatus.FAILED,
+            ],
+          }).orWhere(
+            `(status IN (:...running) AND updated_at < LOCALTIMESTAMP - (:staleMs * INTERVAL '1 millisecond'))`,
+            { running: RUNNING_STATUSES, staleMs: STALE_RUN_MS },
+          );
+        }),
+      )
+      .execute();
+    return (result.affected ?? 0) > 0;
+  }
+
+  private async runReprocess(
+    id: number,
+    step: ReprocessStep,
+    previous: { status: TranscriptionStatus; message: string | null },
+  ): Promise<void> {
+    this.logger.log(`[Reprocess ${id}] ${step}`);
+    let localPath: string | null = null;
+    const options: ProcessOptions = {};
+
+    try {
+      const row = await this.transcriptionRepo.findOne({ where: { id } });
+      const key = row?.processed_audio?.path;
+      if (!row || !key) {
+        throw new Error('صدای آماده‌شده این رونویسی موجود نیست');
+      }
+      const audioUrl = await this.fileService.getPresignedUrl(
+        key,
+        PLAYBACK_URL_TTL,
+      );
+
+      if (step === 'transcribe') {
+        const { tokens } = await this.runSoniox(
+          audioUrl,
+          async () => {
+            localPath ??= await this.downloadToTemp(key, `reprocess-${id}`);
+            return localPath;
+          },
+          id,
+        );
+        if (tokens.length === 0) {
+          throw new Error('تبدیل گفتار به متن خروجی نداشت');
+        }
+        await this.transcriptionRepo.update(
+          id,
+          // Diarization stays, and with it the speaker ids — so the speaker
+          // map, the interviewer choice and the diarization source still hold.
+          rowPatch({ stt_tokens: tokens, ...CLEARED_LINES }),
+        );
+      } else {
+        const result = await this.runDiarization(
+          audioUrl,
+          row.expected_person_ids ?? [],
+        );
+        if (result.diarization.length === 0) {
+          throw new Error('تشخیص گویندگان خروجی نداشت');
+        }
+        await this.transcriptionRepo.update(
+          id,
+          rowPatch({
+            diarization: result.diarization,
+            diarization_source: result.source,
+            ...CLEARED_LINES,
+            // New diarization, new speaker ids: whatever was keyed by the old
+            // ones would now name the wrong voices.
+            speaker_map: null,
+            interviewer_speaker_ids: null,
+          }),
+        );
+        options.suggestedMap = result.suggestedMap;
+      }
+    } catch (error) {
+      const message = describeError(error);
+      this.logger.warn(
+        `[Reprocess ${id}] ${step} failed, recording left as it was: ${message}`,
+      );
+      await this.transcriptionRepo.update(
+        id,
+        rowPatch({
+          // A dead run that was being re-run has nothing to go back to.
+          status: RUNNING_STATUSES.includes(previous.status)
+            ? TranscriptionStatus.FAILED
+            : previous.status,
+          status_message: previous.message,
+        }),
+      );
+      this.reprocessFailures.set(id, {
+        step,
+        message,
+        at: new Date().toISOString(),
+      });
+      return;
+    } finally {
+      if (localPath) this.audioProcessor.safeUnlink(localPath);
+    }
+
+    // Resumes after the step that just ran: lines, samples, speaker mapping.
+    // It owns the status from here on, failures included.
+    await this.processTranscription(id, [], options);
+  }
+
+  /** Is there a speech-to-text result to diarize against? Without loading it. */
+  private async hasSttTokens(id: number): Promise<boolean> {
+    const rows = (await this.transcriptionRepo.query(
+      'SELECT (stt_tokens IS NOT NULL AND jsonb_array_length(stt_tokens) > 0) AS has FROM transcriptions WHERE id = $1',
+      [id],
+    )) as Array<{ has: boolean }>;
+    return !!rows[0]?.has;
+  }
+
+  private async downloadToTemp(key: string, name: string): Promise<string> {
+    const buffer = await this.fileService.downloadFileFromS3(key);
+    const dir = path.join(process.cwd(), 'temp', 'audio');
+    fs.mkdirSync(dir, { recursive: true });
+    const target = path.join(dir, `${name}-${Date.now()}.mp3`);
+    fs.writeFileSync(target, buffer);
+    return target;
+  }
+
+  /**
+   * The notice of a failed re-run, while it is recent enough to matter.
+   */
+  private reprocessFailure(id: number): ReprocessFailure | null {
+    const failure = this.reprocessFailures.get(id);
+    if (!failure) return null;
+    if (Date.now() - new Date(failure.at).getTime() > REPROCESS_NOTICE_TTL_MS) {
+      this.reprocessFailures.delete(id);
+      return null;
+    }
+    return failure;
+  }
+
+  /**
+   * Bring what points into a recording's lines up to date after the lines were
+   * rebuilt. Glossary mentions are dropped — a scan finds them again in the new
+   * text — and evidence is placed again from its quote and audio times (see
+   * `EvidenceService.repointToSegments`). Never fatal: the transcript is the
+   * result, and a stale pointer is a nuisance, not a reason to fail the run.
+   */
+  private async refreshLinePointers(
+    id: number,
+    segments: NonNullable<Transcription['segments']>,
+  ): Promise<void> {
+    try {
+      const dropped = await this.glossaryScan.purgeTranscription(id);
+      const moved = await this.evidenceService.repointToSegments(id, segments);
+      if (dropped > 0 || moved > 0) {
+        this.logger.log(
+          `[Lines ${id}] rebuilt: ${dropped} glossary mention(s) dropped for rescanning, ${moved} evidence item(s) re-pointed`,
+        );
+      }
+    } catch (error) {
+      this.logger.warn(
+        `[Lines ${id}] could not refresh what points into the lines: ${describeError(error)}`,
+      );
+    }
+  }
+
   /**
    * List view, filtered server-side so finding one recording among hundreds
    * doesn't depend on shipping the whole table to the browser. The large
    * text/segment/token columns are never selected here.
    */
-  async list(filter: ListTranscriptionsFilter = {}): Promise<Transcription[]> {
+  async list(
+    filter: ListTranscriptionsFilter = {},
+  ): Promise<
+    Array<Transcription & { reprocess_failure: ReprocessFailure | null }>
+  > {
     const query = this.transcriptionRepo
       .createQueryBuilder('t')
       .leftJoin('t.project', 'p')
@@ -361,7 +691,12 @@ export class TranscriptionService {
       });
     }
 
-    return query.orderBy('t.created_at', 'DESC').getMany();
+    const rows = await query.orderBy('t.created_at', 'DESC').getMany();
+    // So the list can say a re-run failed: the row itself looks untouched.
+    return rows.map((row) => ({
+      ...row,
+      reprocess_failure: this.reprocessFailure(row.id),
+    }));
   }
 
   /** Full detail with presigned playback URLs for the audio + speaker clips. */
@@ -418,6 +753,7 @@ export class TranscriptionService {
       // Voiceprint matching of unassigned speakers after processing — polled by
       // the mapping screen while it runs.
       ...this.speakerIdentification.getState(id),
+      reprocess_failure: this.reprocessFailure(id),
     };
   }
 
@@ -437,7 +773,11 @@ export class TranscriptionService {
     if (!t) {
       throw new HttpException('رونویسی یافت نشد', 404);
     }
-    return { ...t, ...this.speakerIdentification.getState(id) };
+    return {
+      ...t,
+      ...this.speakerIdentification.getState(id),
+      reprocess_failure: this.reprocessFailure(id),
+    };
   }
 
   /**
@@ -494,6 +834,16 @@ export class TranscriptionService {
     }
 
     if (dto.segments !== undefined) {
+      // The editor only exists for a completed recording. Lines sent for one
+      // that is being re-run, or is back at speaker mapping, come from a page
+      // opened before that — saving them would put the old text back over the
+      // rebuilt one.
+      if (t.status !== TranscriptionStatus.COMPLETED) {
+        throw new HttpException(
+          'متن این رونویسی از نو ساخته شده یا در حال ساخت است؛ صفحه را تازه کنید',
+          409,
+        );
+      }
       // Normalize: collapse adjacent segments that share a speaker (e.g. after
       // the user reassigns a line to match its neighbour) into one block.
       Object.assign(
@@ -586,6 +936,9 @@ export class TranscriptionService {
       .getOne();
 
     if (!t) throw new HttpException('رونویسی یافت نشد', 404);
+    if (RUNNING_STATUSES.includes(t.status)) {
+      throw new HttpException('پردازش این رونویسی در حال اجراست', 409);
+    }
     if (!t.stt_tokens?.length) {
       throw new HttpException(
         'توکن‌های گفتار برای این رونویسی ذخیره نشده است',
@@ -620,8 +973,11 @@ export class TranscriptionService {
       `[Remerge] Transcription ${id}: ${t.stt_tokens.length} tokens -> ${segments.length} turns`,
     );
 
-    // Line boundaries moved, so previously recorded positions are stale; the
-    // scan re-establishes them for whatever is still findable.
+    // Line boundaries moved, so previously recorded positions are stale: the
+    // old mentions go and evidence is placed again, then the scan finds the
+    // terms in the new lines. (The scan alone kept the stale mentions: it skips
+    // any line that already has one for the term.)
+    await this.refreshLinePointers(id, patch.segments ?? []);
     this.autoScanGlossary(id, t.project_id ?? null);
 
     return this.getDetail(id);
@@ -648,6 +1004,14 @@ export class TranscriptionService {
     if (!t) throw new HttpException('رونویسی یافت نشد', 404);
     if (t.refine_status === 'processing') {
       throw new HttpException('اصلاح هوشمند در حال اجراست', 409);
+    }
+    // Its result is written over the lines at the end; lines being rebuilt
+    // meanwhile (a re-run) would be overwritten with the old ones, refined.
+    if (t.status !== TranscriptionStatus.COMPLETED) {
+      throw new HttpException(
+        'اصلاح هوشمند فقط روی رونویسی تکمیل‌شده ممکن است',
+        409,
+      );
     }
     if (!t.segments || t.segments.length === 0) {
       throw new HttpException('متنی برای اصلاح وجود ندارد', 400);
@@ -750,6 +1114,12 @@ export class TranscriptionService {
     if (t.refine_status === 'processing') {
       throw new HttpException('اصلاح هوشمند در حال اجراست', 409);
     }
+    if (t.status !== TranscriptionStatus.COMPLETED) {
+      throw new HttpException(
+        'بازگشت به متن پیش از اصلاح فقط روی رونویسی تکمیل‌شده ممکن است',
+        409,
+      );
+    }
     if (!t.segments_before_refine?.length) {
       throw new HttpException('نسخه پیش از اصلاح هوشمند موجود نیست', 400);
     }
@@ -804,7 +1174,11 @@ export class TranscriptionService {
    * preparation has not produced the processed MP3 yet; a resume past that
    * point ignores them and pulls the processed audio from storage on demand.
    */
-  async processTranscription(id: number, localPaths: string[]): Promise<void> {
+  async processTranscription(
+    id: number,
+    localPaths: string[],
+    options: ProcessOptions = {},
+  ): Promise<void> {
     this.logger.log(`[Process] Starting transcription ${id}`);
     let localProcessedPath: string | null = null;
     let ownsLocalProcessed = false;
@@ -902,10 +1276,11 @@ export class TranscriptionService {
         );
         diarization = (row.diarization ?? []) as any;
         // The suggested speaker→person map isn't persisted (it can't be added
-        // without a schema change, and prod runs without synchronize). Resuming
-        // past diarization therefore starts speaker mapping without pre-filled
-        // suggestions — the samples and manual mapping are unaffected.
-        suggestedMap = {};
+        // without a schema change, and prod runs without synchronize). A resume
+        // past diarization therefore has none, unless the caller just ran the
+        // diarization itself (`reprocess`) and hands them over. The mapping
+        // screen matches the samples against voiceprints on opening anyway.
+        suggestedMap = options.suggestedMap ?? {};
       } else {
         await this.setStatus(
           id,
@@ -931,6 +1306,10 @@ export class TranscriptionService {
           segments: segments as any,
           raw_text: this.merger.generateRawText(segments),
         });
+        // New lines: whatever pointed into earlier ones (a re-run) is stale. On
+        // a first run there is nothing yet, and this finds nothing. Mentions
+        // are found again when the speakers are confirmed, so they carry names.
+        await this.refreshLinePointers(id, segments);
       }
 
       // 5. Per-speaker audio samples (extracted from the processed file).
@@ -1308,6 +1687,15 @@ export class TranscriptionService {
     });
     if (!transcription) {
       throw new HttpException('رونویسی یافت نشد', 404);
+    }
+    // A mapping screen opened before a re-run started: its speakers and
+    // samples are about to be replaced, and marking the row completed here
+    // would cut across the run.
+    if (RUNNING_STATUSES.includes(transcription.status)) {
+      throw new HttpException(
+        'این رونویسی در حال پردازش است؛ بعد از پایان پردازش گویندگان را تأیید کنید',
+        409,
+      );
     }
 
     const speakerMap: Record<string, number | null> = {};

@@ -11,6 +11,7 @@ import { PersonModule } from '../person/person.module';
 import { ProjectModule } from '../project/project.module';
 import { AnalysisModule } from '../analysis/analysis.module';
 import { GlossaryModule } from '../glossary/glossary.module';
+import { EvidenceModule } from '../evidence/evidence.module';
 import { UploadModule } from '../upload/upload.module';
 
 @Module({
@@ -28,6 +29,10 @@ import { UploadModule } from '../upload/upload.module';
     // A large recording arrives as a resumable chunked upload; creating the
     // transcription then consumes the finished session.
     UploadModule,
+    // Re-running a step rebuilds the lines, and the project's evidence points
+    // into them. EvidenceModule registers the Transcription entity, not this
+    // module, so there is no cycle.
+    EvidenceModule,
   ],
   controllers: [TranscriptionController],
   providers: [TranscriptionService, SpeakerIdentificationService],

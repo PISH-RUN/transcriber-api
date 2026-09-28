@@ -1,6 +1,6 @@
 import { HttpException, Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { In, Repository } from 'typeorm';
 import {
   SpeakerSample,
   Transcription,
@@ -57,6 +57,15 @@ interface RunState {
   at: number;
 }
 
+/**
+ * Statuses with speakers to match: waiting for mapping, or completed with some
+ * speakers left without a person (asked for explicitly, from the list).
+ */
+const IDENTIFIABLE: TranscriptionStatus[] = [
+  TranscriptionStatus.AWAITING_MAPPING,
+  TranscriptionStatus.COMPLETED,
+];
+
 interface IdentifyPlan {
   /** Samples to send to pyannote in this run. */
   samples: SpeakerSample[];
@@ -64,6 +73,33 @@ interface IdentifyPlan {
   candidates: VoiceprintCandidate[];
   /** `<personId>:<version>` of every candidate, recorded on each checked sample. */
   fingerprints: string[];
+}
+
+/** Why a run did not start — shown to whoever asked for it. */
+export type IdentifySkipReason =
+  | 'running'
+  | 'not_ready'
+  | 'not_configured'
+  | 'no_samples'
+  | 'all_assigned'
+  | 'no_voiceprints'
+  | 'up_to_date';
+
+interface IdentifySkip {
+  reason: IdentifySkipReason;
+  message: string;
+}
+
+export type IdentifyStartResult = SpeakerIdentifyState & {
+  started: boolean;
+  reason?: IdentifySkipReason;
+  message?: string;
+};
+
+/** A scored sample: the clip it was scored on, and its match if any. */
+interface SampleResult {
+  audioPath: string;
+  match: SpeakerMatch | null;
 }
 
 export interface SpeakerMatch {
@@ -74,6 +110,10 @@ export interface SpeakerMatch {
 function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   return typeof error === 'string' && error ? error : 'نامشخص';
+}
+
+function skip(reason: IdentifySkipReason, message: string): IdentifySkip {
+  return { reason, message };
 }
 
 /** A suggestion strong enough to stand without being checked again. */
@@ -117,7 +157,8 @@ export function bestMatch(
  * the speakers of the first one — which is what creates those people's
  * voiceprints — and every other recording of the batch is already sitting in
  * `awaiting_mapping` without a suggestion. This closes that gap when such a
- * recording is opened.
+ * recording is opened. A completed recording gets the same on request, for the
+ * speakers it was confirmed with no one assigned to.
  *
  * It compares the per-speaker sample clips (at most 30s each, already in
  * storage), not the whole recording: the speakers and their numbering stay
@@ -148,12 +189,15 @@ export class SpeakerIdentificationService {
    * unless there is nothing new to compare them with. Returns immediately;
    * progress is reported through `getState`.
    */
-  async start(
-    id: number,
-  ): Promise<SpeakerIdentifyState & { started: boolean }> {
+  async start(id: number): Promise<IdentifyStartResult> {
     this.prune();
     if (this.runs.get(id)?.status === 'processing') {
-      return { started: false, ...this.getState(id) };
+      return {
+        started: false,
+        reason: 'running',
+        message: 'شناسایی گویندگان این رونویسی در حال اجراست',
+        ...this.getState(id),
+      };
     }
 
     // Claim the slot before the first await, so two quick opens of the same
@@ -161,16 +205,21 @@ export class SpeakerIdentificationService {
     const previous = this.runs.get(id);
     this.setRun(id, 'processing', 'در حال بررسی گویندگان...');
 
-    let plan: IdentifyPlan | null;
+    let plan: IdentifyPlan | IdentifySkip;
     try {
       plan = await this.plan(id);
     } catch (error) {
       this.restore(id, previous);
       throw error;
     }
-    if (!plan) {
+    if ('reason' in plan) {
       this.restore(id, previous);
-      return { started: false, ...this.getState(id) };
+      return {
+        started: false,
+        reason: plan.reason,
+        message: plan.message,
+        ...this.getState(id),
+      };
     }
 
     this.setRun(
@@ -191,6 +240,16 @@ export class SpeakerIdentificationService {
     return { started: true, ...this.getState(id) };
   }
 
+  /**
+   * Drop the latest run's outcome: the recording's samples are about to be
+   * rebuilt, and "2 of 3 speakers found" would describe clips that are gone. A
+   * run still in flight keeps its slot; what it found is discarded when it
+   * tries to write it (see `writeSuggestions`).
+   */
+  forget(id: number): void {
+    if (this.runs.get(id)?.status !== 'processing') this.runs.delete(id);
+  }
+
   /** The latest run's outcome, while it is fresh enough to be worth showing. */
   getState(id: number): SpeakerIdentifyState {
     const state = this.runs.get(id);
@@ -206,12 +265,12 @@ export class SpeakerIdentificationService {
   // ---------------------------------------------------------------------------
 
   /**
-   * Decide what a run would do, or `null` when it would do nothing: the
-   * recording is not awaiting mapping, every speaker already has a confident
-   * suggestion, the library is empty, or every open speaker was already
-   * compared with every current voiceprint.
+   * Decide what a run would do, or why it would do nothing: the recording has
+   * no speakers to match yet, every speaker already has a person or a
+   * confident suggestion, the library is empty, or every open speaker was
+   * already compared with every current voiceprint.
    */
-  private async plan(id: number): Promise<IdentifyPlan | null> {
+  private async plan(id: number): Promise<IdentifyPlan | IdentifySkip> {
     const t = await this.transcriptionRepo
       .createQueryBuilder('t')
       .select([
@@ -219,21 +278,45 @@ export class SpeakerIdentificationService {
         't.status',
         't.project_id',
         't.speaker_samples',
+        't.speaker_map',
         't.expected_person_ids',
       ])
       .where('t.id = :id', { id })
       .getOne();
     if (!t) throw new HttpException('رونویسی یافت نشد', 404);
 
-    // Only speakers nobody has assigned yet. A confirmed mapping is the user's
-    // answer, and is not second-guessed.
-    if (t.status !== TranscriptionStatus.AWAITING_MAPPING) return null;
-    if (!this.pyannote.isConfigured()) return null;
+    if (!IDENTIFIABLE.includes(t.status)) {
+      return skip(
+        'not_ready',
+        'این رونویسی هنوز به مرحله تطبیق گویندگان نرسیده است',
+      );
+    }
+    if (!this.pyannote.isConfigured()) {
+      return skip(
+        'not_configured',
+        'سرویس شناسایی گوینده (pyannote) تنظیم نشده است',
+      );
+    }
 
-    const open = (t.speaker_samples ?? []).filter(
-      (sample) => !!sample.audioPath && !isConfident(sample),
+    const withClip = (t.speaker_samples ?? []).filter(
+      (sample) => !!sample.audioPath,
     );
-    if (open.length === 0) return null;
+    if (withClip.length === 0) {
+      return skip('no_samples', 'این رونویسی نمونه صدای گوینده ندارد');
+    }
+
+    // Only speakers nobody has decided on. A person assigned to a speaker is
+    // the user's answer, and is not second-guessed.
+    const open = withClip.filter(
+      (sample) =>
+        t.speaker_map?.[sample.speakerId] == null && !isConfident(sample),
+    );
+    if (open.length === 0) {
+      return skip(
+        'all_assigned',
+        'همه گوینده‌ها شخص یا پیشنهاد مطمئن دارند؛ چیزی برای تطبیق نمانده است',
+      );
+    }
 
     const preferred = [
       ...(t.expected_person_ids ?? []),
@@ -243,14 +326,24 @@ export class SpeakerIdentificationService {
       preferred,
       MAX_VOICEPRINTS,
     );
-    if (candidates.length === 0) return null;
+    if (candidates.length === 0) {
+      return skip(
+        'no_voiceprints',
+        'هنوز هیچ شخصی اثر صوتی ندارد؛ با تأیید گویندگان یک رونویسی، اثر صوتی آن افراد ساخته می‌شود',
+      );
+    }
 
     const fingerprints = candidates.map((c) => `${c.personId}:${c.version}`);
     const samples = open.filter((sample) => {
       const checked = new Set(sample.voiceprintsChecked ?? []);
       return fingerprints.some((f) => !checked.has(f));
     });
-    if (samples.length === 0) return null;
+    if (samples.length === 0) {
+      return skip(
+        'up_to_date',
+        'گوینده‌های بی‌نام قبلاً با همه اثرهای صوتی فعلی مقایسه شده‌اند و تطبیق مطمئنی نداشتند',
+      );
+    }
 
     return { samples, candidates, fingerprints };
   }
@@ -292,17 +385,17 @@ export class SpeakerIdentificationService {
     );
 
     // Per checked speaker: its suggestion, or null when no one matched well.
-    const results = new Map<string, SpeakerMatch | null>();
+    const results = new Map<string, SampleResult>();
     const errors: string[] = [];
     const queue = [...plan.samples];
     const worker = async () => {
       for (let sample = queue.shift(); sample; sample = queue.shift()) {
         try {
           const byPerson = await this.scoreSample(sample, voiceprints);
-          results.set(
-            sample.speakerId,
-            bestMatch(byPerson, MIN_MATCH_CONFIDENCE),
-          );
+          results.set(sample.speakerId, {
+            audioPath: sample.audioPath,
+            match: bestMatch(byPerson, MIN_MATCH_CONFIDENCE),
+          });
           this.logger.log(
             `[Identify ${id}] ${sample.speakerId}: ${this.describeScores(byPerson)}`,
           );
@@ -323,7 +416,7 @@ export class SpeakerIdentificationService {
     const written =
       results.size > 0 && (await this.writeSuggestions(id, plan, results));
     const matched = written
-      ? [...results.values()].filter((match) => match !== null).length
+      ? [...results.values()].filter((result) => result.match !== null).length
       : 0;
 
     if (errors.length > 0) {
@@ -335,7 +428,8 @@ export class SpeakerIdentificationService {
           : `شناسایی خودکار گویندگان ناموفق بود: ${errors[0]}`,
       );
     } else if (!written) {
-      // Confirmed while pyannote was working — there is nothing left to suggest.
+      // The recording moved on while pyannote was working (a re-run rebuilt
+      // its samples, say) — these results belong to clips that are gone.
       this.setRun(id, 'done', null);
     } else if (matched > 0) {
       this.setRun(
@@ -399,40 +493,51 @@ export class SpeakerIdentificationService {
 
   /**
    * Merge the run into the row as it is now, not as it was when planned:
-   * pyannote takes a while, `speaker_samples` is written whole, and the user
-   * may have confirmed the mapping in the meantime — then nothing is written.
+   * pyannote takes a while and `speaker_samples` is written whole. Two things
+   * may have happened meanwhile, and both are checked:
+   *
+   * - the pipeline ran again (`reprocess`) and rebuilt the samples. A rebuilt
+   *   sample can reuse the speaker id but not the clip, so results are applied
+   *   only to the clip they were scored on;
+   * - the row left the mapping stage — the status is part of the UPDATE's own
+   *   condition, so a re-run claiming the row between the read and the write
+   *   makes the write a no-op instead of putting old samples back.
    */
   private async writeSuggestions(
     id: number,
     plan: IdentifyPlan,
-    results: Map<string, SpeakerMatch | null>,
+    results: Map<string, SampleResult>,
   ): Promise<boolean> {
     const fresh = await this.transcriptionRepo
       .createQueryBuilder('t')
       .select(['t.id', 't.status', 't.speaker_samples'])
       .where('t.id = :id', { id })
       .getOne();
-    if (!fresh || fresh.status !== TranscriptionStatus.AWAITING_MAPPING) {
-      return false;
-    }
+    if (!fresh || !IDENTIFIABLE.includes(fresh.status)) return false;
 
+    let applied = 0;
     const samples = (fresh.speaker_samples ?? []).map((sample) => {
-      if (!results.has(sample.speakerId)) return sample;
-      const match = results.get(sample.speakerId);
+      const result = results.get(sample.speakerId);
+      if (!result || result.audioPath !== sample.audioPath) return sample;
+      applied += 1;
       return {
         ...sample,
         voiceprintsChecked: plan.fingerprints,
         // No good match leaves an earlier (weak) processing-time guess alone:
         // it came from the whole recording, and the screen shows its score.
-        ...(match && {
-          suggestedPersonId: match.personId,
-          suggestedConfidence: match.confidence,
+        ...(result.match && {
+          suggestedPersonId: result.match.personId,
+          suggestedConfidence: result.match.confidence,
         }),
       };
     });
+    if (applied === 0) return false;
 
-    await this.transcriptionRepo.update(id, { speaker_samples: samples });
-    return true;
+    const update = await this.transcriptionRepo.update(
+      { id, status: In(IDENTIFIABLE) },
+      { speaker_samples: samples },
+    );
+    return (update.affected ?? 0) > 0;
   }
 
   /** The top three scores, for tuning the threshold from the logs. */

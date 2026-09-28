@@ -22,6 +22,7 @@ import { TranscriptionService } from './transcription.service';
 import { SpeakerIdentificationService } from './speaker-identification.service';
 import {
   ConfirmSpeakersDto,
+  ReprocessTranscriptionDto,
   UpdateTranscriptionDto,
 } from './transcription.dto';
 import { UploadService } from '../upload/upload.service';
@@ -176,7 +177,7 @@ export class TranscriptionController {
     summary:
       'Suggest people for unassigned speakers from the voiceprint library',
     description:
-      'For a recording awaiting speaker mapping, compares each speaker’s sample clip with the voiceprints in the library as it is now — including voiceprints created by mapping other recordings after this one was processed — and stores the matches as suggestions (`suggestedPersonId` / `suggestedConfidence`). Nothing is confirmed. Speakers already compared with every current voiceprint are skipped, so calling it again is free unless the library changed. Returns immediately with `started`; poll GET /transcriptions/:id/status for `speaker_identify_status` / `speaker_identify_message`.',
+      'For a recording awaiting speaker mapping — or a completed one with speakers left unassigned — compares each unassigned speaker’s sample clip with the voiceprints in the library as it is now, including voiceprints created by mapping other recordings after this one was processed, and stores the matches as suggestions (`suggestedPersonId` / `suggestedConfidence`). Nothing is confirmed, and speakers already assigned to a person are left alone. Speakers already compared with every current voiceprint are skipped, so calling it again is free unless the library changed. Returns immediately with `started` (and `reason` / `message` when there was nothing to do); poll GET /transcriptions/:id/status for `speaker_identify_status` / `speaker_identify_message`.',
   })
   identifySpeakers(@Param('id', ParseIntPipe) id: number) {
     return this.speakerIdentification.start(id);
@@ -193,6 +194,19 @@ export class TranscriptionController {
     @Body() dto: UpdateTranscriptionDto,
   ) {
     return this.transcriptionService.update(id, dto);
+  }
+
+  @Post(':id/reprocess')
+  @ApiOperation({
+    summary: 'Run speech-to-text or speaker diarization again',
+    description:
+      'For a processed recording (completed, awaiting mapping, or failed after its audio was prepared). `step: transcribe` runs Soniox again and keeps the diarization, so speakers and the people assigned to them stay; `step: diarize` runs pyannote again on the stored transcript, which resets the speaker assignments. The paid call runs first: if it fails, the recording is left exactly as it was and `reprocess_failure` says why. On success the lines and speaker samples are rebuilt (manual edits and the AI proof-reading are discarded), evidence is re-pointed at the new lines, glossary mentions are found again once speakers are confirmed, and the recording returns to speaker mapping. Returns immediately — poll GET /transcriptions/:id/status.',
+  })
+  reprocess(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() dto: ReprocessTranscriptionDto,
+  ) {
+    return this.transcriptionService.reprocess(id, dto.step);
   }
 
   @Post(':id/retry')

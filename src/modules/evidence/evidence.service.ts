@@ -7,8 +7,106 @@ import { CreateEvidenceDto, UpdateEvidenceDto } from './evidence.dto';
 import { Transcription } from '../transcription/transcription.entity';
 import { ProjectCategoryKind } from '../project/project-category.entity';
 import { ProjectCategoryService } from '../project/project-category.service';
+import {
+  buildAnchorIndex,
+  findAnchor,
+} from '../../common/utils/transcript-anchor';
 
 const NOT_FOUND = 'شواهد یافت نشد';
+
+/** How much of a quote must match before its new position is trusted. */
+const REPOINT_MIN_COVERAGE = 0.9;
+
+/**
+ * A quote found further than this from where the item used to start is
+ * another passage saying the same thing, not this one.
+ */
+const REPOINT_MAX_DRIFT_MS = 60_000;
+
+type AnchorIndex = ReturnType<typeof buildAnchorIndex>;
+type TranscriptLine = NonNullable<Transcription['segments']>[number];
+
+/** The pointer fields of an evidence item, as placed on a rebuilt transcript. */
+interface PlacedEvidence {
+  segment_index: number;
+  end_segment_index: number | null;
+  start_ms: number | null;
+  end_ms: number | null;
+  anchored: boolean;
+}
+
+/** The last line starting at or before `ms` — the line that time falls in. */
+function lineAtMs(segments: TranscriptLine[], ms: number): number {
+  let low = 0;
+  let high = segments.length - 1;
+  let found = 0;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    if ((segments[mid]?.start_ms ?? 0) <= ms) {
+      found = mid;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return found;
+}
+
+/**
+ * Where an evidence item sits in rebuilt lines, or `null` to leave it alone.
+ * See `EvidenceService.repointToSegments`.
+ */
+function placeOnSegments(
+  item: EvidenceItem,
+  segments: TranscriptLine[],
+  index: AnchorIndex,
+): PlacedEvidence | null {
+  // Single-line items keep their shape: some store no end line at all.
+  const endOf = (start: number, end: number): number | null =>
+    end > start ? end : item.end_segment_index == null ? null : start;
+
+  const hit = item.quote ? findAnchor(index, item.quote) : null;
+  const near =
+    hit != null &&
+    (item.start_ms == null ||
+      Math.abs((segments[hit.segmentIndex]?.start_ms ?? 0) - item.start_ms) <=
+        REPOINT_MAX_DRIFT_MS);
+
+  if (hit && near && hit.coverage >= REPOINT_MIN_COVERAGE) {
+    const start = hit.segmentIndex;
+    const end = Math.max(
+      start,
+      index.segmentAt(hit.offset + Math.max(0, hit.length - 1)),
+    );
+    return {
+      segment_index: start,
+      end_segment_index: endOf(start, end),
+      start_ms: segments[start]?.start_ms ?? item.start_ms ?? null,
+      end_ms:
+        item.end_ms == null ? null : (segments[end]?.end_ms ?? item.end_ms),
+      // Found in the text itself, so the pointer is as good as a hand-placed one.
+      anchored: true,
+    };
+  }
+
+  if (item.segment_index == null || item.start_ms == null) return null;
+
+  const start = lineAtMs(segments, item.start_ms);
+  const end =
+    item.end_ms == null
+      ? start
+      : Math.max(
+          start,
+          lineAtMs(segments, Math.max(item.start_ms, item.end_ms - 1)),
+        );
+  return {
+    segment_index: start,
+    end_segment_index: endOf(start, end),
+    start_ms: item.start_ms,
+    end_ms: item.end_ms ?? null,
+    anchored: item.anchored,
+  };
+}
 
 export interface ListEvidenceFilter {
   projectId?: number;
@@ -225,6 +323,53 @@ export class EvidenceService {
     if (!item) throw new HttpException(NOT_FOUND, 404);
     await this.evidenceRepo.remove(item);
     return { success: true };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Rebuilt transcripts
+
+  /**
+   * Point one transcript's evidence at its rebuilt lines.
+   *
+   * `segment_index` / `end_segment_index` count speaker turns, and running
+   * speech-to-text or diarization again rebuilds the turns, so the old numbers
+   * point at other lines. What survives is the evidence itself — its quote —
+   * and its audio times, since the audio did not change. So each item is placed
+   * again from those:
+   *
+   * 1. its quote, found in the new text near where it used to be — exact when
+   *    only the turn boundaries moved;
+   * 2. otherwise the line its start time now falls in — when the words changed
+   *    too, and only for an item that had a line to begin with. An item the
+   *    reviewer never placed stays unplaced rather than getting a guessed line.
+   *
+   * Returns how many items moved.
+   */
+  async repointToSegments(
+    transcriptionId: number,
+    segments: NonNullable<Transcription['segments']>,
+  ): Promise<number> {
+    if (segments.length === 0) return 0;
+
+    const items = await this.evidenceRepo.find({
+      where: { transcription_id: transcriptionId },
+    });
+    if (items.length === 0) return 0;
+
+    const index = buildAnchorIndex(segments);
+    const moved = items.filter((item) => {
+      const placed = placeOnSegments(item, segments, index);
+      if (!placed) return false;
+
+      const changed = (Object.keys(placed) as Array<keyof PlacedEvidence>).some(
+        (key) => (item[key] ?? null) !== placed[key],
+      );
+      if (changed) Object.assign(item, placed);
+      return changed;
+    });
+
+    if (moved.length > 0) await this.evidenceRepo.save(moved, { chunk: 200 });
+    return moved.length;
   }
 
   // ---------------------------------------------------------------------------

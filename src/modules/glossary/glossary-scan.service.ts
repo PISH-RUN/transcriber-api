@@ -200,6 +200,23 @@ export class GlossaryScanService {
     return result;
   }
 
+  /**
+   * Drop every mention recorded against one transcript.
+   *
+   * A mention points into the transcript's lines: `segment_index`, offsets
+   * inside that line, the text around it. When the lines are rebuilt (speech-to-
+   * text or diarization run again, a remerge) those pointers describe text that
+   * no longer exists — and since `scan` is idempotent per (term, line), a stale
+   * pointer would even block the fresh one for the same line. So the old ones
+   * go, and the next scan finds the terms again in the new text.
+   */
+  async purgeTranscription(transcriptionId: number): Promise<number> {
+    const result = await this.mentionRepo.delete({
+      transcription_id: transcriptionId,
+    });
+    return result.affected ?? 0;
+  }
+
   private async loadTerms(
     projectId: number,
     termIds?: number[],

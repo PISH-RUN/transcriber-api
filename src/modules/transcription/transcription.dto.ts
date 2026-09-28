@@ -1,5 +1,6 @@
 import {
   IsArray,
+  IsIn,
   IsInt,
   IsNumber,
   IsOptional,
@@ -34,6 +35,20 @@ export class ConfirmSpeakersDto {
   @ValidateNested({ each: true })
   @Type(() => SpeakerAssignmentDto)
   assignments: SpeakerAssignmentDto[];
+}
+
+export const REPROCESS_STEPS = ['transcribe', 'diarize'] as const;
+export type ReprocessStep = (typeof REPROCESS_STEPS)[number];
+
+export class ReprocessTranscriptionDto {
+  @ApiProperty({
+    enum: REPROCESS_STEPS,
+    example: 'transcribe',
+    description:
+      'مرحله‌ای که دوباره اجرا می‌شود: transcribe (تبدیل دوباره گفتار به متن؛ گویندگان حفظ می‌شوند) یا diarize (تشخیص دوباره گویندگان روی همان متن؛ تخصیص افراد از نو)',
+  })
+  @IsIn(REPROCESS_STEPS)
+  step: ReprocessStep;
 }
 
 export class UpdateSegmentDto {
